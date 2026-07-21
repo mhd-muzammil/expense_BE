@@ -10,13 +10,125 @@ from django.http import HttpResponse
 from rest_framework import viewsets, status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes, action
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated, BasePermission
 from rest_framework.response import Response
 
 from rest_framework.pagination import PageNumberPagination
 
-from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit
-from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer
+from .models import (
+    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE,
+)
+from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer
+
+
+# ---------------------------------------------------------------------------
+# Section-based access control
+# ---------------------------------------------------------------------------
+# Each non-admin user has a UserProfile.allowed_sections list controlling which
+# app pages they may reach. Access is enforced server-side so it can't be
+# bypassed by calling the API directly. Admins (is_staff / is_superuser) get
+# every section implicitly. Endpoints declare which section they belong to via
+# RequireSection(...).
+
+# Legacy group used before per-user sections existed. Users still in it (with no
+# profile) are treated as Dashboard + P&L, preserving old behaviour.
+PNL_ONLY_GROUP = 'pnl_only'
+
+
+def is_admin_user(user):
+    """Admins see everything and can manage other users."""
+    return bool(user and user.is_authenticated and (user.is_staff or user.is_superuser))
+
+
+def get_allowed_sections(user):
+    """The list of section keys this user may access (canonical order)."""
+    if not user or not user.is_authenticated:
+        return []
+    if is_admin_user(user):
+        return list(ALL_SECTIONS)
+    # Per-user profile is the source of truth.
+    profile = getattr(user, 'profile', None)
+    if profile is not None:
+        sections = profile.clean_sections()
+        if sections:
+            return sections
+        # An empty profile list means "no restriction configured yet" only if
+        # they're also not in the legacy group; otherwise fall through.
+    # Legacy pnl_only group → Dashboard + P&L.
+    if user.groups.filter(name=PNL_ONLY_GROUP).exists():
+        return [SECTION_DASHBOARD, SECTION_PNL]
+    # No profile, no group → full access (ordinary account).
+    return list(ALL_SECTIONS)
+
+
+def has_section(user, section):
+    return section in get_allowed_sections(user)
+
+
+def is_pnl_only(user):
+    """Back-compat flag: user can see P&L but NOT the raw Expenses ledger."""
+    if not user or not user.is_authenticated or is_admin_user(user):
+        return False
+    sections = get_allowed_sections(user)
+    return SECTION_PNL in sections and SECTION_EXPENSES not in sections
+
+
+class RequireSection(BasePermission):
+    """Permission factory: only allow users whose sections include `section`.
+
+    Usage:  permission_classes = [IsAuthenticated, RequireSection(SECTION_EXPENSES)]
+    or as a decorator arg on function views.
+    """
+    section = None
+    message = 'Your account does not have access to this section.'
+
+    def __init__(self, section=None):
+        # Allow both RequireSection(SECTION_X) instances and bare class use.
+        if section is not None:
+            self.section = section
+
+    def __call__(self):
+        # DRF instantiates permission classes; when we pass an instance we make
+        # it callable so `RequireSection(SECTION_X)` works in permission_classes.
+        return self
+
+    def has_permission(self, request, view):
+        return has_section(request.user, self.section)
+
+
+class RequireAnySection(BasePermission):
+    """Allow users who have AT LEAST ONE of the given sections.
+
+    Usage: permission_classes = [IsAuthenticated, RequireAnySection(SECTION_A, SECTION_B)]
+    """
+    sections = ()
+    message = 'Your account does not have access to this section.'
+
+    def __init__(self, *sections):
+        if sections:
+            self.sections = sections
+
+    def __call__(self):
+        return self
+
+    def has_permission(self, request, view):
+        allowed = set(get_allowed_sections(request.user))
+        return any(s in allowed for s in self.sections)
+
+
+# Convenience: guards the raw expense ledger + all write/finance endpoints.
+def _require_expenses():
+    return RequireSection(SECTION_EXPENSES)
+
+
+# Backwards-compatible alias — existing decorators reference BlockPnlOnly.
+class BlockPnlOnly(BasePermission):
+    """Deny access to endpoints that require the Expenses section."""
+    message = 'Your account does not have access to this section.'
+
+    def has_permission(self, request, view):
+        return has_section(request.user, SECTION_EXPENSES)
 
 
 class ExpensePagination(PageNumberPagination):
@@ -38,12 +150,14 @@ class BranchViewSet(viewsets.ModelViewSet):
     queryset = Branch.objects.all()
     serializer_class = BranchSerializer
     pagination_class = None
+    permission_classes = [IsAuthenticated, BlockPnlOnly]
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
     """CRUD for expenses with filtering and running balance."""
 
     pagination_class = ExpensePagination
+    permission_classes = [IsAuthenticated, BlockPnlOnly]
 
     def get_serializer_class(self):
         if self.action in ('create', 'update', 'partial_update'):
@@ -134,8 +248,10 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireAnySection(SECTION_DASHBOARD, SECTION_REGION)])
 def dashboard_view(request):
-    """Aggregated dashboard stats."""
+    """Aggregated dashboard stats. Also feeds the Region Expense page, so users
+    with either the Dashboard or Region section may read it."""
     qs = Expense.objects.all()
 
     # Apply same filters
@@ -252,6 +368,7 @@ def dashboard_view(request):
 
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def export_expenses(request):
     """Export expenses to CSV."""
     qs = Expense.objects.select_related('branch').all().order_by('date', 'created_at')
@@ -397,6 +514,7 @@ def export_expenses(request):
 # Payment Mode Balances
 # ---------------------------------------------------------------------------
 @api_view(['GET'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def payment_mode_balances_view(request):
     """Return all payment modes with initial + current balance, including those only present in expenses.
     
@@ -523,6 +641,7 @@ def payment_mode_balances_view(request):
 
 
 @api_view(['POST'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def payment_mode_balance_set(request):
     """Create or update initial balance for a payment mode."""
     mode = request.data.get('payment_mode', '').strip()
@@ -557,6 +676,7 @@ def payment_mode_balance_set(request):
 
 
 @api_view(['DELETE'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def payment_mode_balance_delete(request):
     """Delete a payment mode balance entry."""
     mode = request.data.get('payment_mode', '').strip()
@@ -588,6 +708,222 @@ def categories_view(request):
 
 
 # ---------------------------------------------------------------------------
+# Profit & Loss report — spreadsheet-style Income/Expense × Month matrix.
+# ---------------------------------------------------------------------------
+
+# Junk / aggregate "branch" values that should never appear as a real branch in
+# the P&L. Compared case-insensitively after trimming.
+_PNL_EXCLUDED_BRANCHES = {'', 'null', 'none', 'common', 'all location', 'all locations', 'main branch'}
+
+# Categories that are always income even if a stray debit exists on them. These
+# are the credit-driven revenue streams seen in the ledger. Matched on the
+# canonical (UPPER + trimmed) category name.
+_PNL_INCOME_CATEGORIES = {
+    'LOAN', 'TRADE', 'SERVICE', 'EB RETURN', 'CLIENT RETURN', 'QUALITY TAX',
+    'WARRANTY BILLS', 'WARRANTY BILL', 'BENCH ARC', 'ULR', 'OUT OF WARRANTY',
+}
+
+# Categories that are always expense even if a stray credit exists on them
+# (e.g. a refund credited back onto SALARY/EXPENSES). Matched on canonical name.
+_PNL_EXPENSE_CATEGORIES = {
+    'SALARY', 'EXPENSES', 'EXPENSE', 'VENDOR', 'MISC', 'PETROL', 'PETROL ALLOWANCE',
+    'RENT', 'OFFICE RENT', 'GST', 'LOAN RETURN',
+}
+
+
+def _pnl_canonical(name):
+    """Canonical display form for a messy free-text label: trim + collapse
+    internal whitespace + upper-case for matching. Returns '' for blank."""
+    if not name:
+        return ''
+    return ' '.join(str(name).split()).upper()
+
+
+def _pnl_classify(canonical_category, total_credit, total_debit):
+    """Decide whether a category is 'income' or 'expense'.
+
+    Data-driven with a hardcoded override for known ambiguous categories, so new
+    categories added later are still classified automatically:
+      1. Explicit income/expense sets win first.
+      2. Otherwise, whichever side (credit vs debit) has the larger magnitude.
+      3. Ties / all-zero fall back to 'expense' (the common case).
+    """
+    if canonical_category in _PNL_INCOME_CATEGORIES:
+        return 'income'
+    if canonical_category in _PNL_EXPENSE_CATEGORIES:
+        return 'expense'
+    if total_credit > total_debit:
+        return 'income'
+    return 'expense'
+
+
+def _pnl_financial_year_bounds(fy_start_year):
+    """Given a starting year (e.g. 2025) return (start_date, end_date) for the
+    Indian financial year Apr 1 <start> – Mar 31 <start+1>, plus the ordered list
+    of 12 month keys 'YYYY-MM' from April to March."""
+    from datetime import date
+    start = date(fy_start_year, 4, 1)
+    end = date(fy_start_year + 1, 3, 31)
+    months = []
+    for i in range(12):
+        m = 4 + i
+        y = fy_start_year + (m - 1) // 12
+        mm = (m - 1) % 12 + 1
+        months.append(f'{y:04d}-{mm:02d}')
+    return start, end, months
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireSection(SECTION_PNL)])
+def profit_loss_view(request):
+    """Profit & Loss matrix: income & expense categories (rows) × months (cols).
+
+    Query params:
+      fy       – financial-year start year, e.g. '2025' for FY 2025-26 (Apr–Mar).
+                 Defaults to the FY containing the most recent expense (or today).
+      branch   – branch id or (case-insensitive) location substring; junk/aggregate
+                 branches are excluded from the default (all-branch) view.
+
+    All messy real-world data is normalised in Python: branches and categories are
+    merged case-insensitively, and income/expense is decided per category.
+    """
+    qs = Expense.objects.all()
+
+    # ---- Branch filter (case-insensitive; digits => exact id) ----
+    branch_val = request.query_params.get('branch')
+    if branch_val:
+        if branch_val.isdigit():
+            qs = qs.filter(branch_id=branch_val)
+        else:
+            qs = qs.filter(branch__location__icontains=branch_val)
+
+    # ---- Determine the financial year window ----
+    fy_param = request.query_params.get('fy')
+    if fy_param and fy_param.isdigit():
+        fy_start = int(fy_param)
+    else:
+        latest = Expense.objects.order_by('-date').values_list('date', flat=True).first()
+        ref = latest if latest else datetime.now().date()
+        # Jan–Mar belongs to the FY that started the previous calendar year.
+        fy_start = ref.year if ref.month >= 4 else ref.year - 1
+
+    start_date, end_date, month_keys = _pnl_financial_year_bounds(fy_start)
+    qs = qs.filter(date__gte=start_date, date__lte=end_date)
+
+    # ---- Aggregate: category × month, credit & debit ----
+    rows = (
+        qs.annotate(month=TruncMonth('date'))
+        .values('category', 'month')
+        .annotate(
+            credit=Coalesce(Sum('credited_amount'), Decimal('0.00')),
+            debit=Coalesce(Sum('debited_amount'), Decimal('0.00')),
+        )
+    )
+
+    # Merge case-variant categories together and bucket amounts by month.
+    # canon -> {'display': str, 'credit_total': Decimal, 'debit_total': Decimal,
+    #           'months': {month_key: {'credit': Decimal, 'debit': Decimal}}}
+    cat_map = {}
+    for r in rows:
+        canon = _pnl_canonical(r['category'])
+        if not canon:
+            canon = 'UNCATEGORISED'
+        month_key = r['month'].strftime('%Y-%m') if r['month'] else ''
+        entry = cat_map.get(canon)
+        if entry is None:
+            # Title-case a nicer display label from the canonical form.
+            entry = {
+                'display': canon.title(),
+                'credit_total': Decimal('0.00'),
+                'debit_total': Decimal('0.00'),
+                'months': {},
+            }
+            cat_map[canon] = entry
+        entry['credit_total'] += r['credit']
+        entry['debit_total'] += r['debit']
+        mslot = entry['months'].setdefault(month_key, {'credit': Decimal('0.00'), 'debit': Decimal('0.00')})
+        mslot['credit'] += r['credit']
+        mslot['debit'] += r['debit']
+
+    # Build income & expense row lists. For income rows the per-month value is the
+    # credit; for expense rows it's the debit — that's what a P&L shows.
+    income_rows, expense_rows = [], []
+    for canon, entry in cat_map.items():
+        kind = _pnl_classify(canon, entry['credit_total'], entry['debit_total'])
+        if kind == 'income':
+            monthly = {mk: entry['months'].get(mk, {}).get('credit', Decimal('0.00')) for mk in month_keys}
+            total = sum(monthly.values(), Decimal('0.00'))
+            if total == 0:
+                continue  # skip empty income rows for this FY
+            income_rows.append({'category': entry['display'], 'monthly': monthly, 'total': total})
+        else:
+            monthly = {mk: entry['months'].get(mk, {}).get('debit', Decimal('0.00')) for mk in month_keys}
+            total = sum(monthly.values(), Decimal('0.00'))
+            if total == 0:
+                continue
+            expense_rows.append({'category': entry['display'], 'monthly': monthly, 'total': total})
+
+    # Sort each section by grand total, largest first (most material rows on top).
+    income_rows.sort(key=lambda x: x['total'], reverse=True)
+    expense_rows.sort(key=lambda x: x['total'], reverse=True)
+
+    def _serialize_rows(section):
+        return [
+            {
+                'category': row['category'],
+                'monthly': {mk: str(row['monthly'][mk]) for mk in month_keys},
+                'total': str(row['total']),
+            }
+            for row in section
+        ]
+
+    # Column (per-month) totals + net profit/loss per month.
+    income_by_month = {mk: sum((row['monthly'][mk] for row in income_rows), Decimal('0.00')) for mk in month_keys}
+    expense_by_month = {mk: sum((row['monthly'][mk] for row in expense_rows), Decimal('0.00')) for mk in month_keys}
+    net_by_month = {mk: income_by_month[mk] - expense_by_month[mk] for mk in month_keys}
+
+    total_income = sum(income_by_month.values(), Decimal('0.00'))
+    total_expense = sum(expense_by_month.values(), Decimal('0.00'))
+
+    # Build the branch dropdown list: canonical, de-duplicated, junk excluded.
+    branch_names = {}
+    for loc in Branch.objects.values_list('location', flat=True):
+        canon = _pnl_canonical(loc)
+        if canon.lower() in _PNL_EXCLUDED_BRANCHES:
+            continue
+        branch_names.setdefault(canon, canon.title())
+    branches = sorted(branch_names.values())
+
+    # Available financial years (for the FY picker), derived from data.
+    first_date = Expense.objects.order_by('date').values_list('date', flat=True).first()
+    last_date = Expense.objects.order_by('-date').values_list('date', flat=True).first()
+    fy_list = []
+    if first_date and last_date:
+        lo_fy = first_date.year if first_date.month >= 4 else first_date.year - 1
+        hi_fy = last_date.year if last_date.month >= 4 else last_date.year - 1
+        fy_list = list(range(lo_fy, hi_fy + 1))
+    if fy_start not in fy_list:
+        fy_list.append(fy_start)
+    fy_list = sorted(set(fy_list), reverse=True)
+
+    return Response({
+        'fy_start': fy_start,
+        'fy_label': f'FY {fy_start}-{str(fy_start + 1)[-2:]}',
+        'months': month_keys,
+        'available_fys': fy_list,
+        'branches': branches,
+        'income': _serialize_rows(income_rows),
+        'expense': _serialize_rows(expense_rows),
+        'income_by_month': {mk: str(income_by_month[mk]) for mk in month_keys},
+        'expense_by_month': {mk: str(expense_by_month[mk]) for mk in month_keys},
+        'net_by_month': {mk: str(net_by_month[mk]) for mk in month_keys},
+        'total_income': str(total_income),
+        'total_expense': str(total_expense),
+        'net_profit': str(total_income - total_expense),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 @api_view(['POST'])
@@ -615,6 +951,9 @@ def login_view(request):
         'token': token.key,
         'username': user.username,
         'is_staff': user.is_staff,
+        'is_admin': is_admin_user(user),
+        'allowed_sections': get_allowed_sections(user),
+        'pnl_only': is_pnl_only(user),
     })
 
 
@@ -633,13 +972,149 @@ def me_view(request):
     return Response({
         'username': request.user.username,
         'is_staff': request.user.is_staff,
+        'is_admin': is_admin_user(request.user),
+        'allowed_sections': get_allowed_sections(request.user),
+        'pnl_only': is_pnl_only(request.user),
     })
+
+
+# ---------------------------------------------------------------------------
+# Admin: user management (create login accounts + control section access)
+# ---------------------------------------------------------------------------
+from django.contrib.auth.models import User as AuthUserModel
+
+
+class IsAdminSection(BasePermission):
+    """Only staff/superusers may manage users."""
+    message = 'Only administrators can manage users.'
+
+    def has_permission(self, request, view):
+        return is_admin_user(request.user)
+
+
+def _serialize_managed_user(user):
+    """Public shape of a user row for the admin panel."""
+    return {
+        'id': user.id,
+        'username': user.username,
+        'is_admin': is_admin_user(user),
+        'is_active': user.is_active,
+        'allowed_sections': get_allowed_sections(user),
+        'date_joined': user.date_joined.isoformat() if user.date_joined else None,
+    }
+
+
+def _clean_section_input(raw):
+    """Validate a requested section list → canonical, de-duplicated subset."""
+    if not isinstance(raw, list):
+        return None
+    wanted = {str(s).strip().lower() for s in raw}
+    return [s for s in ALL_SECTIONS if s in wanted]
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminSection])
+def admin_sections_view(request):
+    """List the sections that can be granted, with labels (for the UI)."""
+    from .models import SECTION_LABELS
+    return Response([
+        {'key': key, 'label': SECTION_LABELS.get(key, key)}
+        for key in ALL_SECTIONS
+    ])
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated, IsAdminSection])
+def admin_users_view(request):
+    """GET: list all users. POST: create a new login account with sections."""
+    if request.method == 'GET':
+        users = AuthUserModel.objects.all().order_by('-is_superuser', 'username')
+        return Response([_serialize_managed_user(u) for u in users])
+
+    # --- POST: create ---
+    username = (request.data.get('username') or '').strip()
+    password = request.data.get('password') or ''
+    sections = _clean_section_input(request.data.get('allowed_sections', []))
+
+    if not username or not password:
+        return Response({'detail': 'Username and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if sections is None:
+        return Response({'detail': 'allowed_sections must be a list.'}, status=status.HTTP_400_BAD_REQUEST)
+    if AuthUserModel.objects.filter(username__iexact=username).exists():
+        return Response({'detail': f"A user named '{username}' already exists."}, status=status.HTTP_400_BAD_REQUEST)
+    if len(password) < 6:
+        return Response({'detail': 'Password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = AuthUserModel.objects.create_user(username=username, password=password)
+    user.is_staff = False
+    user.is_superuser = False
+    user.save()
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    profile.allowed_sections = sections
+    profile.save()
+    return Response(_serialize_managed_user(user), status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated, IsAdminSection])
+def admin_user_detail_view(request, pk):
+    """PATCH: update sections / reset password. DELETE: remove the account."""
+    try:
+        user = AuthUserModel.objects.get(pk=pk)
+    except AuthUserModel.DoesNotExist:
+        return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    # Guard: never let an admin lock themselves out or edit an admin's access.
+    if request.method == 'DELETE':
+        if user.id == request.user.id:
+            return Response({'detail': 'You cannot delete your own account.'}, status=status.HTTP_400_BAD_REQUEST)
+        if is_admin_user(user):
+            return Response({'detail': 'Admin accounts cannot be deleted here.'}, status=status.HTTP_400_BAD_REQUEST)
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # --- PATCH ---
+    if is_admin_user(user):
+        return Response({'detail': 'Admin accounts always have full access and cannot be edited here.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Update sections if provided.
+    if 'allowed_sections' in request.data:
+        sections = _clean_section_input(request.data.get('allowed_sections'))
+        if sections is None:
+            return Response({'detail': 'allowed_sections must be a list.'}, status=status.HTTP_400_BAD_REQUEST)
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        profile.allowed_sections = sections
+        profile.save()
+        # Once an explicit profile is set, drop the legacy group so it can't
+        # override the per-user sections.
+        user.groups.remove(*user.groups.filter(name=PNL_ONLY_GROUP))
+
+    # Reset password if provided.
+    new_password = request.data.get('password')
+    if new_password:
+        if len(new_password) < 6:
+            return Response({'detail': 'Password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(new_password)
+        user.save()
+        # Invalidate existing tokens so the old session can't linger.
+        Token.objects.filter(user=user).delete()
+
+    # Toggle active state if provided.
+    if 'is_active' in request.data:
+        user.is_active = bool(request.data.get('is_active'))
+        user.save()
+        if not user.is_active:
+            Token.objects.filter(user=user).delete()
+
+    user.refresh_from_db()
+    return Response(_serialize_managed_user(user))
 
 
 # ---------------------------------------------------------------------------
 # Billing Reminders
 # ---------------------------------------------------------------------------
 @api_view(['GET'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def billing_reminders_list(request):
     """List all billing reminders."""
     reminders = BillingReminder.objects.all()
@@ -648,6 +1123,7 @@ def billing_reminders_list(request):
 
 
 @api_view(['POST'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def billing_reminder_create(request):
     """Create a new billing reminder."""
     serializer = BillingReminderSerializer(data=request.data)
@@ -658,6 +1134,7 @@ def billing_reminder_create(request):
 
 
 @api_view(['PUT'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def billing_reminder_update(request, pk):
     """Update a billing reminder."""
     try:
@@ -673,6 +1150,7 @@ def billing_reminder_update(request, pk):
 
 
 @api_view(['PATCH'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def billing_reminder_toggle_paid(request, pk):
     """Toggle the is_paid status of a billing reminder."""
     try:
@@ -687,6 +1165,7 @@ def billing_reminder_toggle_paid(request, pk):
 
 
 @api_view(['DELETE'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def billing_reminder_delete(request, pk):
     """Delete a billing reminder."""
     try:
@@ -699,6 +1178,7 @@ def billing_reminder_delete(request, pk):
 
 
 @api_view(['POST'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def import_expenses(request):
     """Import expenses from Excel or CSV file."""
     file_obj = request.FILES.get('file')
@@ -993,6 +1473,7 @@ class PettyCashDebitViewSet(viewsets.ModelViewSet):
     queryset = PettyCashDebit.objects.select_related('branch').all()
     serializer_class = PettyCashDebitSerializer
     pagination_class = None
+    permission_classes = [IsAuthenticated, BlockPnlOnly]
 
     def get_queryset(self):
         qs = PettyCashDebit.objects.select_related('branch').all()
@@ -1014,6 +1495,7 @@ class PettyCashDebitViewSet(viewsets.ModelViewSet):
 
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
 def petty_cash_summary(request):
     """Get petty cash summary, including credits (from Expenses) and debits."""
     credits_qs = Expense.objects.filter(category__icontains='petty')
@@ -1058,4 +1540,25 @@ def petty_cash_summary(request):
         'credits': credits_data,
         'debits': debits_data,
     })
+
+
+# ---------------------------------------------------------------------------
+# Invoices
+# ---------------------------------------------------------------------------
+class InvoiceViewSet(viewsets.ModelViewSet):
+    """CRUD for customer invoices (Tax Invoice / Bill of Supply)."""
+    queryset = Invoice.objects.prefetch_related('items').all()
+    serializer_class = InvoiceSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_INVOICE)]
+
+    def get_queryset(self):
+        qs = Invoice.objects.prefetch_related('items').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(invoice_number__icontains=search) |
+                Q(customer_name__icontains=search)
+            )
+        return qs.order_by('-issue_date', '-created_at')
 

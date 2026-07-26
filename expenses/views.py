@@ -16,7 +16,7 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 
 from .models import (
-    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice,
+    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, AppSetting,
     UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE,
 )
 from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer
@@ -242,7 +242,18 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['delete'], url_path='delete-all')
     def delete_all(self, request):
-        """Utility endpoint to delete all expenses."""
+        """Delete all expenses. Gated by the admin-configured clear-data password
+        so it can't be triggered by accident or via a direct API call."""
+        setting = AppSetting.get_solo()
+        if not setting.clear_password_is_set:
+            return Response(
+                {'detail': 'No clear-data password is configured. Ask an admin to set one in Settings first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        password = request.data.get('password') if isinstance(request.data, dict) else None
+        if not password or not setting.check_clear_password(password):
+            return Response({'detail': 'Incorrect password.'}, status=status.HTTP_403_FORBIDDEN)
+
         count, _ = Expense.objects.all().delete()
         return Response({'detail': f'Successfully deleted {count} expenses.'}, status=status.HTTP_200_OK)
 
@@ -1021,6 +1032,23 @@ def admin_sections_view(request):
         {'key': key, 'label': SECTION_LABELS.get(key, key)}
         for key in ALL_SECTIONS
     ])
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated, IsAdminSection])
+def clear_data_password_view(request):
+    """Admin-only. GET reports whether a clear-data password is set; POST sets or
+    changes it (hashed). This password gates the destructive Clear All Data action."""
+    setting = AppSetting.get_solo()
+    if request.method == 'GET':
+        return Response({'is_set': setting.clear_password_is_set})
+
+    password = (request.data.get('password') or '') if isinstance(request.data, dict) else ''
+    if len(password) < 4:
+        return Response({'detail': 'Password must be at least 4 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+    setting.set_clear_password(password)
+    setting.save()
+    return Response({'is_set': True})
 
 
 @api_view(['GET', 'POST'])

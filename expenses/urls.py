@@ -30,6 +30,7 @@ urlpatterns = [
     path('auth/me/', views.me_view, name='auth-me'),
     # Admin: user management
     path('admin/sections/', views.admin_sections_view, name='admin-sections'),
+    path('admin/clear-data-password/', views.clear_data_password_view, name='admin-clear-data-password'),
     path('admin/users/', views.admin_users_view, name='admin-users'),
     path('admin/users/<int:pk>/', views.admin_user_detail_view, name='admin-user-detail'),
 ]

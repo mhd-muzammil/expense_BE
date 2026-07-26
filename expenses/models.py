@@ -387,3 +387,32 @@ class InvoiceItem(models.Model):
         return self.taxable_value + self.cgst_amount + self.sgst_amount
 
 
+class AppSetting(models.Model):
+    """Singleton row for app-wide settings. Currently holds the hashed password
+    that gates the destructive "Clear All Data" action."""
+    clear_data_password = models.CharField(max_length=256, blank=True, default='')  # hashed
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"AppSetting (clear password {'set' if self.clear_data_password else 'unset'})"
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def set_clear_password(self, raw):
+        from django.contrib.auth.hashers import make_password
+        self.clear_data_password = make_password(raw)
+
+    def check_clear_password(self, raw):
+        from django.contrib.auth.hashers import check_password
+        if not self.clear_data_password:
+            return False
+        return check_password(raw, self.clear_data_password)
+
+    @property
+    def clear_password_is_set(self):
+        return bool(self.clear_data_password)
+
+

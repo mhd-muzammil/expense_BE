@@ -178,7 +178,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         # Filter by category
         category = self.request.query_params.get('category')
         if category:
-            qs = qs.filter(category=category)
+            qs = qs.filter(category__iexact=category)
 
         # Filter by date range
         date_from = self.request.query_params.get('date_from')
@@ -257,6 +257,38 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         count, _ = Expense.objects.all().delete()
         return Response({'detail': f'Successfully deleted {count} expenses.'}, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['get'], url_path='filter-options')
+    def filter_options(self, request):
+        """Branches and categories ACTUALLY used in expense entries — for the
+        filter dropdowns. De-duplicated case-insensitively, junk removed, and
+        title-cased for display. Backend filters via icontains/iexact so a single
+        cleaned entry matches every casing variant."""
+        def clean(values, junk=frozenset()):
+            seen = {}
+            for v in values:
+                v = ' '.join((v or '').split())
+                if not v:
+                    continue
+                key = v.upper()
+                if key in junk:
+                    continue
+                if key not in seen:
+                    seen[key] = ' '.join(w[:1].upper() + w[1:].lower() for w in v.split(' '))
+            return sorted(seen.values(), key=lambda s: s.lower())
+
+        branch_vals = (
+            Expense.objects.exclude(branch__location='')
+            .values_list('branch__location', flat=True).distinct()
+        )
+        cat_vals = (
+            Expense.objects.exclude(category='')
+            .values_list('category', flat=True).distinct()
+        )
+        return Response({
+            'branches': clean(branch_vals, frozenset({'NULL', 'NONE', 'UNDEFINED'})),
+            'categories': clean(cat_vals),
+        })
+
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, RequireAnySection(SECTION_DASHBOARD, SECTION_REGION)])
@@ -275,7 +307,7 @@ def dashboard_view(request):
 
     category = request.query_params.get('category')
     if category:
-        qs = qs.filter(category=category)
+        qs = qs.filter(category__iexact=category)
 
     date_from = request.query_params.get('date_from')
     date_to = request.query_params.get('date_to')
@@ -394,7 +426,7 @@ def export_expenses(request):
 
     category = request.query_params.get('category')
     if category:
-        qs = qs.filter(category=category)
+        qs = qs.filter(category__iexact=category)
 
     date_from = request.query_params.get('date_from')
     date_to = request.query_params.get('date_to')
@@ -714,8 +746,20 @@ def payment_mode_balance_delete(request):
 # ---------------------------------------------------------------------------
 @api_view(['GET'])
 def categories_view(request):
-    """Single source of truth for expense categories (drawn from the model)."""
-    return Response([value for value, _ in Expense.CATEGORY_CHOICES])
+    """Expense categories: the model's suggested choices PLUS every distinct
+    category actually used in the ledger, so filters/suggestions reflect real
+    data. De-duplicated case-insensitively (first-seen casing wins)."""
+    model_choices = [value for value, _ in Expense.CATEGORY_CHOICES]
+    used = Expense.objects.exclude(category='').values_list('category', flat=True).distinct()
+    seen = {}
+    for c in list(model_choices) + list(used):
+        c = ' '.join((c or '').split())
+        if not c:
+            continue
+        key = c.upper()
+        if key not in seen:
+            seen[key] = c
+    return Response(sorted(seen.values(), key=lambda s: s.lower()))
 
 
 # ---------------------------------------------------------------------------

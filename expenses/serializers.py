@@ -1,6 +1,6 @@
 from decimal import Decimal
 from rest_framework import serializers
-from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem
+from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem
 
 
 class BranchSerializer(serializers.ModelSerializer):
@@ -225,6 +225,24 @@ def amount_in_words_inr(amount):
     return ' '.join(parts).strip()
 
 
+def next_document_number(model, field, prefix, base):
+    """Return the next 'prefix{seq}' document number, where seq is (the highest
+    existing numeric suffix for that prefix) + 1, starting at `base` when none
+    exist. Uses a NUMERIC max (parsed suffix) rather than a lexicographic string
+    sort, so it stays correct across the 999->1000 boundary (a plain
+    order_by('-field') would rank 'PUR-999' above 'PUR-1000' and collide)."""
+    existing = model.objects.filter(**{f'{field}__startswith': prefix}).values_list(field, flat=True)
+    max_seq = base - 1
+    for num in existing:
+        try:
+            s = int(str(num).rsplit('-', 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if s > max_seq:
+            max_seq = s
+    return f"{prefix}{max_seq + 1}"
+
+
 class InvoiceItemSerializer(serializers.ModelSerializer):
     taxable_value = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     cgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
@@ -280,27 +298,421 @@ class InvoiceSerializer(serializers.ModelSerializer):
         return invoice
 
     def _next_invoice_number(self):
-        """Generate 'RT{fy}-REN-{seq}' e.g. RT25-26-REN-2472, incrementing from
-        the highest existing sequence."""
+        """Generate 'RT{fy}-REN-{seq}' e.g. RT25-26-REN-2472."""
         from datetime import date
         today = date.today()
         fy_start = today.year if today.month >= 4 else today.year - 1
         fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
-        prefix = f"RT{fy}-REN-"
-        last = (
-            Invoice.objects.filter(invoice_number__startswith=prefix)
-            .order_by('-invoice_number')
-            .values_list('invoice_number', flat=True)
-            .first()
-        )
-        seq = 1
-        if last:
-            try:
-                seq = int(last.rsplit('-', 1)[-1]) + 1
-            except (ValueError, IndexError):
-                seq = Invoice.objects.count() + 1
-        else:
-            # Continue from a sensible base so numbers look established.
-            seq = 2472
-        return f"{prefix}{seq}"
+        return next_document_number(Invoice, 'invoice_number', f"RT{fy}-REN-", 2472)
+
+
+# ---------------------------------------------------------------------------
+# Delivery Challan
+# ---------------------------------------------------------------------------
+class DeliveryChallanItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DeliveryChallanItem
+        fields = ['id', 'description', 'sub_description', 'hsn_sac', 'quantity', 'uom', 'position']
+
+
+class DeliveryChallanSerializer(serializers.ModelSerializer):
+    items = DeliveryChallanItemSerializer(many=True)
+
+    class Meta:
+        model = DeliveryChallan
+        fields = [
+            'id', 'challan_number',
+            'customer_name', 'customer_phone', 'customer_address', 'customer_gstin',
+            'ship_to_name', 'ship_to_address',
+            'challan_date', 'shipping_date', 'place_of_supply', 'notes', 'terms',
+            'items', 'created_at',
+        ]
+        read_only_fields = ['created_at']
+        extra_kwargs = {'challan_number': {'required': False, 'allow_blank': True}}
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        if not validated_data.get('challan_number'):
+            validated_data['challan_number'] = self._next_challan_number()
+        challan = DeliveryChallan.objects.create(**validated_data)
+        for idx, item in enumerate(items_data):
+            item.setdefault('position', idx)
+            DeliveryChallanItem.objects.create(challan=challan, **item)
+        return challan
+
+    def _next_challan_number(self):
+        """Generate 'RT/{fy}/OTW/RPL-{seq}' e.g. RT/25-26/OTW/RPL-5302."""
+        from datetime import date
+        today = date.today()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+        return next_document_number(DeliveryChallan, 'challan_number', f"RT/{fy}/OTW/RPL-", 5302)
+
+
+# ---------------------------------------------------------------------------
+# Purchase Bill
+# ---------------------------------------------------------------------------
+class PurchaseBillItemSerializer(serializers.ModelSerializer):
+    taxable_value = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    half_gst_rate = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = PurchaseBillItem
+        fields = [
+            'id', 'description', 'sub_description', 'hsn_sac', 'quantity', 'uom',
+            'unit_price', 'gst_rate', 'position',
+            'taxable_value', 'cgst_amount', 'sgst_amount', 'half_gst_rate', 'line_total',
+        ]
+
+
+class PurchaseBillSerializer(serializers.ModelSerializer):
+    items = PurchaseBillItemSerializer(many=True)
+    taxable_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total_raw = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    rounded_off = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    amount_in_words = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PurchaseBill
+        fields = [
+            'id', 'bill_number',
+            'vendor_name', 'vendor_phone', 'vendor_address', 'vendor_gstin', 'vendor_pan', 'vendor_invoice_number',
+            'ship_to_name', 'ship_to_address',
+            'issue_date', 'due_date', 'place_of_supply', 'notes', 'terms',
+            'items',
+            'taxable_total', 'cgst_total', 'sgst_total',
+            'grand_total', 'grand_total_raw', 'rounded_off', 'amount_in_words',
+            'created_at',
+        ]
+        read_only_fields = ['created_at']
+        extra_kwargs = {'bill_number': {'required': False, 'allow_blank': True}}
+
+    def get_amount_in_words(self, obj):
+        return amount_in_words_inr(obj.grand_total)
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        if not validated_data.get('bill_number'):
+            validated_data['bill_number'] = self._next_bill_number()
+        bill = PurchaseBill.objects.create(**validated_data)
+        for idx, item in enumerate(items_data):
+            item.setdefault('position', idx)
+            PurchaseBillItem.objects.create(bill=bill, **item)
+        return bill
+
+    def _next_bill_number(self):
+        """Generate 'RT{fy}/PUR-{seq}' e.g. RT25-26/PUR-5074."""
+        from datetime import date
+        today = date.today()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+        return next_document_number(PurchaseBill, 'bill_number', f"RT{fy}/PUR-", 5074)
+
+
+# ---------------------------------------------------------------------------
+# Purchase Order
+# ---------------------------------------------------------------------------
+class PurchaseOrderItemSerializer(serializers.ModelSerializer):
+    taxable_value = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    half_gst_rate = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = PurchaseOrderItem
+        fields = [
+            'id', 'description', 'sub_description', 'hsn_sac', 'quantity', 'uom',
+            'unit_price', 'gst_rate', 'position',
+            'taxable_value', 'cgst_amount', 'sgst_amount', 'half_gst_rate', 'line_total',
+        ]
+
+
+class PurchaseOrderSerializer(serializers.ModelSerializer):
+    items = PurchaseOrderItemSerializer(many=True)
+    taxable_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total_raw = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    rounded_off = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    amount_in_words = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PurchaseOrder
+        fields = [
+            'id', 'order_number',
+            'vendor_name', 'vendor_phone', 'vendor_address', 'vendor_gstin', 'vendor_pan',
+            'ship_to_name', 'ship_to_address',
+            'issue_date', 'valid_until', 'place_of_supply', 'notes', 'terms',
+            'items',
+            'taxable_total', 'cgst_total', 'sgst_total',
+            'grand_total', 'grand_total_raw', 'rounded_off', 'amount_in_words',
+            'created_at',
+        ]
+        read_only_fields = ['created_at']
+        extra_kwargs = {'order_number': {'required': False, 'allow_blank': True}}
+
+    def get_amount_in_words(self, obj):
+        return amount_in_words_inr(obj.grand_total)
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        if not validated_data.get('order_number'):
+            validated_data['order_number'] = self._next_order_number()
+        order = PurchaseOrder.objects.create(**validated_data)
+        for idx, item in enumerate(items_data):
+            item.setdefault('position', idx)
+            PurchaseOrderItem.objects.create(order=order, **item)
+        return order
+
+    def _next_order_number(self):
+        """Generate 'RT/{fy}/PUR-{seq}' e.g. RT/25-26/PUR-444."""
+        from datetime import date
+        today = date.today()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+        return next_document_number(PurchaseOrder, 'order_number', f"RT/{fy}/PUR-", 444)
+
+
+# ---------------------------------------------------------------------------
+# Payment Receipt
+# ---------------------------------------------------------------------------
+class PaymentReceiptLineSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaymentReceiptLine
+        fields = ['id', 'document_number', 'document_date', 'document_amount', 'payment_amount', 'position']
+
+
+class PaymentReceiptSerializer(serializers.ModelSerializer):
+    lines = PaymentReceiptLineSerializer(many=True)
+    amount_received = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    amount_in_words = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PaymentReceipt
+        fields = [
+            'id', 'receipt_number',
+            'receipt_to_name', 'receipt_to_phone', 'receipt_to_address',
+            'payment_date', 'payment_method', 'notes', 'terms',
+            'lines', 'amount_received', 'amount_in_words', 'created_at',
+        ]
+        read_only_fields = ['created_at']
+        extra_kwargs = {'receipt_number': {'required': False, 'allow_blank': True}}
+
+    def get_amount_in_words(self, obj):
+        return amount_in_words_inr(obj.amount_received)
+
+    def create(self, validated_data):
+        lines_data = validated_data.pop('lines', [])
+        if not validated_data.get('receipt_number'):
+            validated_data['receipt_number'] = self._next_receipt_number()
+        receipt = PaymentReceipt.objects.create(**validated_data)
+        for idx, line in enumerate(lines_data):
+            line.setdefault('position', idx)
+            PaymentReceiptLine.objects.create(receipt=receipt, **line)
+        return receipt
+
+    def _next_receipt_number(self):
+        """Generate 'RT/{fy}/SER-{seq}' e.g. RT/26-27/SER-2817."""
+        from datetime import date
+        today = date.today()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+        return next_document_number(PaymentReceipt, 'receipt_number', f"RT/{fy}/SER-", 2817)
+
+
+# ---------------------------------------------------------------------------
+# Quote
+# ---------------------------------------------------------------------------
+class QuoteItemSerializer(serializers.ModelSerializer):
+    taxable_value = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    half_gst_rate = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = QuoteItem
+        fields = [
+            'id', 'description', 'sub_description', 'hsn_sac', 'quantity', 'uom',
+            'unit_price', 'gst_rate', 'position',
+            'taxable_value', 'cgst_amount', 'sgst_amount', 'half_gst_rate', 'line_total',
+        ]
+
+
+class QuoteSerializer(serializers.ModelSerializer):
+    items = QuoteItemSerializer(many=True)
+    taxable_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total_raw = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    rounded_off = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    amount_in_words = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Quote
+        fields = [
+            'id', 'quote_number',
+            'customer_name', 'customer_phone', 'customer_address', 'customer_gstin',
+            'ship_to_name', 'ship_to_address',
+            'issue_date', 'valid_until', 'place_of_supply', 'notes', 'terms',
+            'items',
+            'taxable_total', 'cgst_total', 'sgst_total',
+            'grand_total', 'grand_total_raw', 'rounded_off', 'amount_in_words',
+            'created_at',
+        ]
+        read_only_fields = ['created_at']
+        extra_kwargs = {'quote_number': {'required': False, 'allow_blank': True}}
+
+    def get_amount_in_words(self, obj):
+        return amount_in_words_inr(obj.grand_total)
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        if not validated_data.get('quote_number'):
+            validated_data['quote_number'] = self._next_quote_number()
+        quote = Quote.objects.create(**validated_data)
+        for idx, item in enumerate(items_data):
+            item.setdefault('position', idx)
+            QuoteItem.objects.create(quote=quote, **item)
+        return quote
+
+    def _next_quote_number(self):
+        """Generate 'RT{fy}/QEN-{seq}' e.g. RT26-27/QEN-2646."""
+        from datetime import date
+        today = date.today()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+        return next_document_number(Quote, 'quote_number', f"RT{fy}/QEN-", 2646)
+
+
+# ---------------------------------------------------------------------------
+# Bill of Supply (no GST)
+# ---------------------------------------------------------------------------
+class BillOfSupplyItemSerializer(serializers.ModelSerializer):
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = BillOfSupplyItem
+        fields = ['id', 'description', 'sub_description', 'hsn_sac', 'quantity', 'uom', 'unit_price', 'position', 'amount']
+
+
+class BillOfSupplySerializer(serializers.ModelSerializer):
+    items = BillOfSupplyItemSerializer(many=True)
+    taxable_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total_raw = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    rounded_off = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    amount_in_words = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BillOfSupply
+        fields = [
+            'id', 'bos_number',
+            'customer_name', 'customer_phone', 'customer_address', 'customer_gstin',
+            'ship_to_name', 'ship_to_address',
+            'issue_date', 'due_date', 'place_of_supply', 'notes', 'terms',
+            'items', 'taxable_total', 'grand_total', 'grand_total_raw', 'rounded_off', 'amount_in_words',
+            'created_at',
+        ]
+        read_only_fields = ['created_at']
+        extra_kwargs = {'bos_number': {'required': False, 'allow_blank': True}}
+
+    def get_amount_in_words(self, obj):
+        return amount_in_words_inr(obj.grand_total)
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        if not validated_data.get('bos_number'):
+            validated_data['bos_number'] = self._next_bos_number()
+        bos = BillOfSupply.objects.create(**validated_data)
+        for idx, item in enumerate(items_data):
+            item.setdefault('position', idx)
+            BillOfSupplyItem.objects.create(bos=bos, **item)
+        return bos
+
+    def _next_bos_number(self):
+        """Generate 'RT{fy}-REN-{seq}' e.g. RT26-27-REN-2487."""
+        from datetime import date
+        today = date.today()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+        return next_document_number(BillOfSupply, 'bos_number', f"RT{fy}-REN-", 2487)
+
+
+# ---------------------------------------------------------------------------
+# Tax Invoice (CGST+SGST intra-state / IGST inter-state)
+# ---------------------------------------------------------------------------
+class TaxInvoiceItemSerializer(serializers.ModelSerializer):
+    taxable_value = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    igst_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    half_gst_rate = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = TaxInvoiceItem
+        fields = [
+            'id', 'description', 'sub_description', 'hsn_sac', 'quantity', 'uom',
+            'unit_price', 'gst_rate', 'position',
+            'taxable_value', 'cgst_amount', 'sgst_amount', 'igst_amount', 'half_gst_rate', 'line_total',
+        ]
+
+
+class TaxInvoiceSerializer(serializers.ModelSerializer):
+    items = TaxInvoiceItemSerializer(many=True)
+    is_inter_state = serializers.BooleanField(read_only=True)
+    taxable_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    cgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    sgst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    igst_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    grand_total_raw = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    rounded_off = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    amount_in_words = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TaxInvoice
+        fields = [
+            'id', 'ti_number',
+            'customer_name', 'customer_phone', 'customer_address', 'customer_gstin',
+            'ship_to_name', 'ship_to_address',
+            'issue_date', 'due_date', 'place_of_supply', 'notes', 'terms',
+            'items', 'is_inter_state',
+            'taxable_total', 'cgst_total', 'sgst_total', 'igst_total',
+            'grand_total', 'grand_total_raw', 'rounded_off', 'amount_in_words',
+            'created_at',
+        ]
+        read_only_fields = ['created_at']
+        extra_kwargs = {'ti_number': {'required': False, 'allow_blank': True}}
+
+    def get_amount_in_words(self, obj):
+        return amount_in_words_inr(obj.grand_total)
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        if not validated_data.get('ti_number'):
+            validated_data['ti_number'] = self._next_ti_number()
+        invoice = TaxInvoice.objects.create(**validated_data)
+        for idx, item in enumerate(items_data):
+            item.setdefault('position', idx)
+            TaxInvoiceItem.objects.create(invoice=invoice, **item)
+        return invoice
+
+    def _next_ti_number(self):
+        """Generate 'RT{fy}-SER-{seq}' e.g. RT26-27-SER-12."""
+        from datetime import date
+        today = date.today()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+        return next_document_number(TaxInvoice, 'ti_number', f"RT{fy}-SER-", 12)
 

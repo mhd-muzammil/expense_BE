@@ -16,10 +16,10 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 
 from .models import (
-    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE,
+    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, AppSetting,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE,
 )
-from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer
+from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +150,7 @@ class BranchViewSet(viewsets.ModelViewSet):
     queryset = Branch.objects.all()
     serializer_class = BranchSerializer
     pagination_class = None
-    permission_classes = [IsAuthenticated, BlockPnlOnly]
+    permission_classes = [IsAuthenticated, RequireAnySection(SECTION_EXPENSES, SECTION_PETTYCASH)]
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
@@ -1545,7 +1545,7 @@ class PettyCashDebitViewSet(viewsets.ModelViewSet):
     queryset = PettyCashDebit.objects.select_related('branch').all()
     serializer_class = PettyCashDebitSerializer
     pagination_class = None
-    permission_classes = [IsAuthenticated, BlockPnlOnly]
+    permission_classes = [IsAuthenticated, RequireAnySection(SECTION_EXPENSES, SECTION_PETTYCASH)]
 
     def get_queryset(self):
         qs = PettyCashDebit.objects.select_related('branch').all()
@@ -1567,7 +1567,7 @@ class PettyCashDebitViewSet(viewsets.ModelViewSet):
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated, BlockPnlOnly])
+@permission_classes([IsAuthenticated, RequireAnySection(SECTION_EXPENSES, SECTION_PETTYCASH)])
 def petty_cash_summary(request):
     """Get petty cash summary, including credits (from Expenses) and debits."""
     credits_qs = Expense.objects.filter(category__icontains='petty')
@@ -1632,5 +1632,125 @@ class InvoiceViewSet(viewsets.ModelViewSet):
                 Q(invoice_number__icontains=search) |
                 Q(customer_name__icontains=search)
             )
+        return qs.order_by('-issue_date', '-created_at')
+
+
+class DeliveryChallanViewSet(viewsets.ModelViewSet):
+    """CRUD for delivery challans (goods delivery, no amounts)."""
+    queryset = DeliveryChallan.objects.prefetch_related('items').all()
+    serializer_class = DeliveryChallanSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_CHALLAN)]
+
+    def get_queryset(self):
+        qs = DeliveryChallan.objects.prefetch_related('items').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(challan_number__icontains=search) |
+                Q(customer_name__icontains=search)
+            )
+        return qs.order_by('-challan_date', '-created_at')
+
+
+class PurchaseBillViewSet(viewsets.ModelViewSet):
+    """CRUD for purchase bills (goods/services bought from vendors)."""
+    queryset = PurchaseBill.objects.prefetch_related('items').all()
+    serializer_class = PurchaseBillSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_PURCHASE)]
+
+    def get_queryset(self):
+        qs = PurchaseBill.objects.prefetch_related('items').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(bill_number__icontains=search) |
+                Q(vendor_name__icontains=search)
+            )
+        return qs.order_by('-issue_date', '-created_at')
+
+
+class PurchaseOrderViewSet(viewsets.ModelViewSet):
+    """CRUD for purchase orders (issued to vendors before buying)."""
+    queryset = PurchaseOrder.objects.prefetch_related('items').all()
+    serializer_class = PurchaseOrderSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_PORDER)]
+
+    def get_queryset(self):
+        qs = PurchaseOrder.objects.prefetch_related('items').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(order_number__icontains=search) |
+                Q(vendor_name__icontains=search)
+            )
+        return qs.order_by('-issue_date', '-created_at')
+
+
+class PaymentReceiptViewSet(viewsets.ModelViewSet):
+    """CRUD for payment receipts (money received from customers)."""
+    queryset = PaymentReceipt.objects.prefetch_related('lines').all()
+    serializer_class = PaymentReceiptSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_RECEIPT)]
+
+    def get_queryset(self):
+        qs = PaymentReceipt.objects.prefetch_related('lines').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(receipt_number__icontains=search) |
+                Q(receipt_to_name__icontains=search)
+            )
+        return qs.order_by('-payment_date', '-created_at')
+
+
+class QuoteViewSet(viewsets.ModelViewSet):
+    """CRUD for price quotes issued to customers."""
+    queryset = Quote.objects.prefetch_related('items').all()
+    serializer_class = QuoteSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_QUOTE)]
+
+    def get_queryset(self):
+        qs = Quote.objects.prefetch_related('items').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(quote_number__icontains=search) |
+                Q(customer_name__icontains=search)
+            )
+        return qs.order_by('-issue_date', '-created_at')
+
+
+class BillOfSupplyViewSet(viewsets.ModelViewSet):
+    """CRUD for bills of supply (sales without GST)."""
+    queryset = BillOfSupply.objects.prefetch_related('items').all()
+    serializer_class = BillOfSupplySerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_BOS)]
+
+    def get_queryset(self):
+        qs = BillOfSupply.objects.prefetch_related('items').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(Q(bos_number__icontains=search) | Q(customer_name__icontains=search))
+        return qs.order_by('-issue_date', '-created_at')
+
+
+class TaxInvoiceViewSet(viewsets.ModelViewSet):
+    """CRUD for GST tax invoices (CGST+SGST intra-state / IGST inter-state)."""
+    queryset = TaxInvoice.objects.prefetch_related('items').all()
+    serializer_class = TaxInvoiceSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_TAXINVOICE)]
+
+    def get_queryset(self):
+        qs = TaxInvoice.objects.prefetch_related('items').all()
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(Q(ti_number__icontains=search) | Q(customer_name__icontains=search))
         return qs.order_by('-issue_date', '-created_at')
 

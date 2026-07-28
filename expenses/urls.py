@@ -7,6 +7,13 @@ router.register(r'expenses', views.ExpenseViewSet, basename='expense')
 router.register(r'branches', views.BranchViewSet, basename='branch')
 router.register(r'petty-cash-debits', views.PettyCashDebitViewSet, basename='petty-cash-debit')
 router.register(r'invoices', views.InvoiceViewSet, basename='invoice')
+router.register(r'delivery-challans', views.DeliveryChallanViewSet, basename='delivery-challan')
+router.register(r'purchase-bills', views.PurchaseBillViewSet, basename='purchase-bill')
+router.register(r'purchase-orders', views.PurchaseOrderViewSet, basename='purchase-order')
+router.register(r'payment-receipts', views.PaymentReceiptViewSet, basename='payment-receipt')
+router.register(r'quotes', views.QuoteViewSet, basename='quote')
+router.register(r'bills-of-supply', views.BillOfSupplyViewSet, basename='bill-of-supply')
+router.register(r'tax-invoices', views.TaxInvoiceViewSet, basename='tax-invoice')
 
 urlpatterns = [
     path('', include(router.urls)),

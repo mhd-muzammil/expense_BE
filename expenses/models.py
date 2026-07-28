@@ -11,8 +11,16 @@ SECTION_EXPENSES = 'expenses'
 SECTION_PNL = 'pnl'
 SECTION_REGION = 'region'
 SECTION_INVOICE = 'invoice'
+SECTION_CHALLAN = 'challan'
+SECTION_PURCHASE = 'purchase'
+SECTION_PORDER = 'porder'
+SECTION_RECEIPT = 'receipt'
+SECTION_PETTYCASH = 'pettycash'
+SECTION_QUOTE = 'quote'
+SECTION_BOS = 'bos'
+SECTION_TAXINVOICE = 'taxinvoice'
 
-ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE]
+ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE]
 
 SECTION_LABELS = {
     SECTION_DASHBOARD: 'Dashboard',
@@ -20,7 +28,27 @@ SECTION_LABELS = {
     SECTION_PNL: 'Profit & Loss',
     SECTION_REGION: 'Region Expense',
     SECTION_INVOICE: 'Invoice',
+    SECTION_CHALLAN: 'Delivery Challan',
+    SECTION_PURCHASE: 'Purchase Bill',
+    SECTION_PORDER: 'Purchase Order',
+    SECTION_RECEIPT: 'Payment Receipt',
+    SECTION_PETTYCASH: 'Petty Cash',
+    SECTION_QUOTE: 'Quote',
+    SECTION_BOS: 'Bill of Supply',
+    SECTION_TAXINVOICE: 'Tax Invoice',
 }
+
+# Our own company's GST state code (Tamil Nadu). A supply to a different state
+# code is inter-state (IGST); same state is intra-state (CGST + SGST).
+COMPANY_STATE_CODE = '33'
+
+
+def parse_state_code(place_of_supply):
+    """Extract the numeric GST state code from a 'Place of Supply' string like
+    'TN (33)' or 'KA (29)'. Returns the code as a string, or '' if not found."""
+    import re
+    m = re.search(r'(\d{2})', str(place_of_supply or ''))
+    return m.group(1) if m else ''
 
 
 class Branch(models.Model):
@@ -385,6 +413,617 @@ class InvoiceItem(models.Model):
     @property
     def line_total(self):
         return self.taxable_value + self.cgst_amount + self.sgst_amount
+
+
+class DeliveryChallan(models.Model):
+    """A goods delivery challan. Like an invoice but WITHOUT any amounts — it
+    records what items are shipped, to whom, when."""
+    challan_number = models.CharField(max_length=60, unique=True, blank=True)
+
+    # Bill To
+    customer_name = models.CharField(max_length=200)
+    customer_phone = models.CharField(max_length=40, blank=True, default='')
+    customer_address = models.TextField(blank=True, default='')
+    customer_gstin = models.CharField(max_length=20, blank=True, default='')
+
+    # Ship To (falls back to Bill To when blank)
+    ship_to_name = models.CharField(max_length=200, blank=True, default='')
+    ship_to_address = models.TextField(blank=True, default='')
+
+    challan_date = models.DateField()
+    shipping_date = models.DateField(null=True, blank=True)
+    place_of_supply = models.CharField(max_length=100, blank=True, default='TN (33)')
+
+    notes = models.TextField(blank=True, default='')
+    terms = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-challan_date', '-created_at']
+
+    def __str__(self):
+        return f"{self.challan_number} | {self.customer_name}"
+
+
+class DeliveryChallanItem(models.Model):
+    """A single line on a delivery challan — no price/amount, just qty."""
+    challan = models.ForeignKey(DeliveryChallan, on_delete=models.CASCADE, related_name='items')
+    description = models.CharField(max_length=300)
+    sub_description = models.TextField(blank=True, default='')
+    hsn_sac = models.CharField(max_length=20, blank=True, default='')
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, default=1)
+    uom = models.CharField(max_length=20, blank=True, default='')
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity}"
+
+
+class PurchaseBill(models.Model):
+    """A purchase bill — goods/services bought FROM a vendor. Same GST maths as
+    an invoice, but the counterparty is a Vendor (with PAN) and it records the
+    vendor's own invoice number."""
+    bill_number = models.CharField(max_length=60, unique=True, blank=True)
+
+    # Vendor (the seller we bought from)
+    vendor_name = models.CharField(max_length=200)
+    vendor_phone = models.CharField(max_length=40, blank=True, default='')
+    vendor_address = models.TextField(blank=True, default='')
+    vendor_gstin = models.CharField(max_length=20, blank=True, default='')
+    vendor_pan = models.CharField(max_length=20, blank=True, default='')
+    vendor_invoice_number = models.CharField(max_length=60, blank=True, default='')
+
+    # Ship To (defaults to our own company details on the frontend)
+    ship_to_name = models.CharField(max_length=200, blank=True, default='')
+    ship_to_address = models.TextField(blank=True, default='')
+
+    issue_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    place_of_supply = models.CharField(max_length=100, blank=True, default='TN (33)')
+
+    notes = models.TextField(blank=True, default='')
+    terms = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-issue_date', '-created_at']
+
+    def __str__(self):
+        return f"{self.bill_number} | {self.vendor_name}"
+
+    # --- Derived amounts (mirror Invoice) ---
+    @property
+    def taxable_total(self):
+        from decimal import Decimal
+        return sum((item.taxable_value for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def cgst_total(self):
+        from decimal import Decimal
+        return sum((item.cgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def sgst_total(self):
+        from decimal import Decimal
+        return sum((item.sgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def has_gst(self):
+        return any(item.gst_rate and item.gst_rate > 0 for item in self.items.all())
+
+    @property
+    def grand_total_raw(self):
+        return self.taxable_total + self.cgst_total + self.sgst_total
+
+    @property
+    def grand_total(self):
+        from decimal import Decimal, ROUND_HALF_UP
+        return self.grand_total_raw.quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+
+    @property
+    def rounded_off(self):
+        return self.grand_total - self.grand_total_raw
+
+
+class PurchaseBillItem(models.Model):
+    """A single line on a purchase bill (with price + GST, like an invoice)."""
+    bill = models.ForeignKey(PurchaseBill, on_delete=models.CASCADE, related_name='items')
+    description = models.CharField(max_length=300)
+    sub_description = models.TextField(blank=True, default='')
+    hsn_sac = models.CharField(max_length=20, blank=True, default='')
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, default=1)
+    uom = models.CharField(max_length=20, blank=True, default='')
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    gst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity}"
+
+    @property
+    def taxable_value(self):
+        from decimal import Decimal
+        return (self.quantity * self.unit_price).quantize(Decimal('0.01'))
+
+    @property
+    def half_gst_rate(self):
+        from decimal import Decimal
+        return (self.gst_rate / Decimal('2')) if self.gst_rate else Decimal('0')
+
+    @property
+    def cgst_amount(self):
+        from decimal import Decimal
+        return (self.taxable_value * self.half_gst_rate / Decimal('100')).quantize(Decimal('0.01'))
+
+    @property
+    def sgst_amount(self):
+        return self.cgst_amount
+
+    @property
+    def line_total(self):
+        return self.taxable_value + self.cgst_amount + self.sgst_amount
+
+
+class PurchaseOrder(models.Model):
+    """A purchase order — issued to a vendor BEFORE buying. Same GST maths as a
+    purchase bill, but has a 'Valid Until' date and no vendor invoice number."""
+    order_number = models.CharField(max_length=60, unique=True, blank=True)
+
+    # Vendor
+    vendor_name = models.CharField(max_length=200)
+    vendor_phone = models.CharField(max_length=40, blank=True, default='')
+    vendor_address = models.TextField(blank=True, default='')
+    vendor_gstin = models.CharField(max_length=20, blank=True, default='')
+    vendor_pan = models.CharField(max_length=20, blank=True, default='')
+
+    # Ship To (defaults to our own company on the frontend)
+    ship_to_name = models.CharField(max_length=200, blank=True, default='')
+    ship_to_address = models.TextField(blank=True, default='')
+
+    issue_date = models.DateField()
+    valid_until = models.DateField(null=True, blank=True)
+    place_of_supply = models.CharField(max_length=100, blank=True, default='TN (33)')
+
+    notes = models.TextField(blank=True, default='')
+    terms = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-issue_date', '-created_at']
+
+    def __str__(self):
+        return f"{self.order_number} | {self.vendor_name}"
+
+    @property
+    def taxable_total(self):
+        from decimal import Decimal
+        return sum((item.taxable_value for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def cgst_total(self):
+        from decimal import Decimal
+        return sum((item.cgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def sgst_total(self):
+        from decimal import Decimal
+        return sum((item.sgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def has_gst(self):
+        return any(item.gst_rate and item.gst_rate > 0 for item in self.items.all())
+
+    @property
+    def grand_total_raw(self):
+        return self.taxable_total + self.cgst_total + self.sgst_total
+
+    @property
+    def grand_total(self):
+        from decimal import Decimal, ROUND_HALF_UP
+        return self.grand_total_raw.quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+
+    @property
+    def rounded_off(self):
+        return self.grand_total - self.grand_total_raw
+
+
+class PurchaseOrderItem(models.Model):
+    """A single line on a purchase order (with price + GST)."""
+    order = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name='items')
+    description = models.CharField(max_length=300)
+    sub_description = models.TextField(blank=True, default='')
+    hsn_sac = models.CharField(max_length=20, blank=True, default='')
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, default=1)
+    uom = models.CharField(max_length=20, blank=True, default='')
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    gst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity}"
+
+    @property
+    def taxable_value(self):
+        from decimal import Decimal
+        return (self.quantity * self.unit_price).quantize(Decimal('0.01'))
+
+    @property
+    def half_gst_rate(self):
+        from decimal import Decimal
+        return (self.gst_rate / Decimal('2')) if self.gst_rate else Decimal('0')
+
+    @property
+    def cgst_amount(self):
+        from decimal import Decimal
+        return (self.taxable_value * self.half_gst_rate / Decimal('100')).quantize(Decimal('0.01'))
+
+    @property
+    def sgst_amount(self):
+        return self.cgst_amount
+
+    @property
+    def line_total(self):
+        return self.taxable_value + self.cgst_amount + self.sgst_amount
+
+
+class PaymentReceipt(models.Model):
+    """A payment receipt — money RECEIVED from a customer against one or more
+    documents (invoices). No GST; just document lines + payment amounts."""
+    receipt_number = models.CharField(max_length=60, unique=True, blank=True)
+
+    # Receipt To (the payer)
+    receipt_to_name = models.CharField(max_length=200)
+    receipt_to_phone = models.CharField(max_length=40, blank=True, default='')
+    receipt_to_address = models.TextField(blank=True, default='')
+
+    payment_date = models.DateField()
+    payment_method = models.CharField(max_length=40, blank=True, default='Bank Transfer')
+
+    notes = models.TextField(blank=True, default='')
+    terms = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-payment_date', '-created_at']
+
+    def __str__(self):
+        return f"{self.receipt_number} | {self.receipt_to_name}"
+
+    @property
+    def amount_received(self):
+        from decimal import Decimal
+        return sum((line.payment_amount for line in self.lines.all()), Decimal('0.00'))
+
+
+class PaymentReceiptLine(models.Model):
+    """A single settled document on a payment receipt."""
+    receipt = models.ForeignKey(PaymentReceipt, on_delete=models.CASCADE, related_name='lines')
+    document_number = models.CharField(max_length=100, blank=True, default='')
+    document_date = models.DateField(null=True, blank=True)
+    document_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    payment_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return f"{self.document_number}: {self.payment_amount}"
+
+
+class Quote(models.Model):
+    """A price quotation issued to a customer. Same GST maths as an invoice, with
+    a 'Valid Until' date and a 'Quote To' customer."""
+    quote_number = models.CharField(max_length=60, unique=True, blank=True)
+
+    # Quote To (the customer)
+    customer_name = models.CharField(max_length=200)
+    customer_phone = models.CharField(max_length=40, blank=True, default='')
+    customer_address = models.TextField(blank=True, default='')
+    customer_gstin = models.CharField(max_length=20, blank=True, default='')
+
+    # Ship To (falls back to Quote To when blank)
+    ship_to_name = models.CharField(max_length=200, blank=True, default='')
+    ship_to_address = models.TextField(blank=True, default='')
+
+    issue_date = models.DateField()
+    valid_until = models.DateField(null=True, blank=True)
+    place_of_supply = models.CharField(max_length=100, blank=True, default='TN (33)')
+
+    notes = models.TextField(blank=True, default='')
+    terms = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-issue_date', '-created_at']
+
+    def __str__(self):
+        return f"{self.quote_number} | {self.customer_name}"
+
+    @property
+    def taxable_total(self):
+        from decimal import Decimal
+        return sum((item.taxable_value for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def cgst_total(self):
+        from decimal import Decimal
+        return sum((item.cgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def sgst_total(self):
+        from decimal import Decimal
+        return sum((item.sgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def has_gst(self):
+        return any(item.gst_rate and item.gst_rate > 0 for item in self.items.all())
+
+    @property
+    def grand_total_raw(self):
+        return self.taxable_total + self.cgst_total + self.sgst_total
+
+    @property
+    def grand_total(self):
+        from decimal import Decimal, ROUND_HALF_UP
+        return self.grand_total_raw.quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+
+    @property
+    def rounded_off(self):
+        return self.grand_total - self.grand_total_raw
+
+
+class QuoteItem(models.Model):
+    """A single line on a quote (with price + GST)."""
+    quote = models.ForeignKey(Quote, on_delete=models.CASCADE, related_name='items')
+    description = models.CharField(max_length=300)
+    sub_description = models.TextField(blank=True, default='')
+    hsn_sac = models.CharField(max_length=20, blank=True, default='')
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, default=1)
+    uom = models.CharField(max_length=20, blank=True, default='')
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    gst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity}"
+
+    @property
+    def taxable_value(self):
+        from decimal import Decimal
+        return (self.quantity * self.unit_price).quantize(Decimal('0.01'))
+
+    @property
+    def half_gst_rate(self):
+        from decimal import Decimal
+        return (self.gst_rate / Decimal('2')) if self.gst_rate else Decimal('0')
+
+    @property
+    def cgst_amount(self):
+        from decimal import Decimal
+        return (self.taxable_value * self.half_gst_rate / Decimal('100')).quantize(Decimal('0.01'))
+
+    @property
+    def sgst_amount(self):
+        return self.cgst_amount
+
+    @property
+    def line_total(self):
+        return self.taxable_value + self.cgst_amount + self.sgst_amount
+
+
+class BillOfSupply(models.Model):
+    """A Bill of Supply — sale without GST (composition/exempt). Item table shows
+    only Price and Amount (no tax columns)."""
+    bos_number = models.CharField(max_length=60, unique=True, blank=True)
+
+    customer_name = models.CharField(max_length=200)
+    customer_phone = models.CharField(max_length=40, blank=True, default='')
+    customer_address = models.TextField(blank=True, default='')
+    customer_gstin = models.CharField(max_length=20, blank=True, default='')
+
+    ship_to_name = models.CharField(max_length=200, blank=True, default='')
+    ship_to_address = models.TextField(blank=True, default='')
+
+    issue_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    place_of_supply = models.CharField(max_length=100, blank=True, default='TN (33)')
+
+    notes = models.TextField(blank=True, default='')
+    terms = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-issue_date', '-created_at']
+
+    def __str__(self):
+        return f"{self.bos_number} | {self.customer_name}"
+
+    @property
+    def taxable_total(self):
+        from decimal import Decimal
+        return sum((item.amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def grand_total_raw(self):
+        return self.taxable_total
+
+    @property
+    def grand_total(self):
+        from decimal import Decimal, ROUND_HALF_UP
+        return self.grand_total_raw.quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+
+    @property
+    def rounded_off(self):
+        return self.grand_total - self.grand_total_raw
+
+
+class BillOfSupplyItem(models.Model):
+    """A single line on a bill of supply (price + amount, no GST)."""
+    bos = models.ForeignKey(BillOfSupply, on_delete=models.CASCADE, related_name='items')
+    description = models.CharField(max_length=300)
+    sub_description = models.TextField(blank=True, default='')
+    hsn_sac = models.CharField(max_length=20, blank=True, default='')
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, default=1)
+    uom = models.CharField(max_length=20, blank=True, default='')
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity}"
+
+    @property
+    def amount(self):
+        from decimal import Decimal
+        return (self.quantity * self.unit_price).quantize(Decimal('0.01'))
+
+
+class TaxInvoice(models.Model):
+    """A GST tax invoice. Uses CGST+SGST for intra-state supplies and IGST for
+    inter-state supplies (decided from the Place of Supply state code)."""
+    ti_number = models.CharField(max_length=60, unique=True, blank=True)
+
+    customer_name = models.CharField(max_length=200)
+    customer_phone = models.CharField(max_length=40, blank=True, default='')
+    customer_address = models.TextField(blank=True, default='')
+    customer_gstin = models.CharField(max_length=20, blank=True, default='')
+
+    ship_to_name = models.CharField(max_length=200, blank=True, default='')
+    ship_to_address = models.TextField(blank=True, default='')
+
+    issue_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    place_of_supply = models.CharField(max_length=100, blank=True, default='TN (33)')
+
+    notes = models.TextField(blank=True, default='')
+    terms = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-issue_date', '-created_at']
+
+    def __str__(self):
+        return f"{self.ti_number} | {self.customer_name}"
+
+    @property
+    def is_inter_state(self):
+        """True when the place-of-supply state differs from our company state →
+        IGST applies. Falls back to intra-state if the code can't be parsed."""
+        code = parse_state_code(self.place_of_supply)
+        return bool(code) and code != COMPANY_STATE_CODE
+
+    @property
+    def taxable_total(self):
+        from decimal import Decimal
+        return sum((item.taxable_value for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def cgst_total(self):
+        from decimal import Decimal
+        return sum((item.cgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def sgst_total(self):
+        from decimal import Decimal
+        return sum((item.sgst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def igst_total(self):
+        from decimal import Decimal
+        return sum((item.igst_amount for item in self.items.all()), Decimal('0.00'))
+
+    @property
+    def grand_total_raw(self):
+        return self.taxable_total + self.cgst_total + self.sgst_total + self.igst_total
+
+    @property
+    def grand_total(self):
+        from decimal import Decimal, ROUND_HALF_UP
+        return self.grand_total_raw.quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+
+    @property
+    def rounded_off(self):
+        return self.grand_total - self.grand_total_raw
+
+
+class TaxInvoiceItem(models.Model):
+    """A single line on a tax invoice. Tax is CGST+SGST (intra) or IGST (inter)."""
+    invoice = models.ForeignKey(TaxInvoice, on_delete=models.CASCADE, related_name='items')
+    description = models.CharField(max_length=300)
+    sub_description = models.TextField(blank=True, default='')
+    hsn_sac = models.CharField(max_length=20, blank=True, default='')
+    quantity = models.DecimalField(max_digits=12, decimal_places=2, default=1)
+    uom = models.CharField(max_length=20, blank=True, default='')
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    gst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity}"
+
+    @property
+    def taxable_value(self):
+        from decimal import Decimal
+        return (self.quantity * self.unit_price).quantize(Decimal('0.01'))
+
+    @property
+    def half_gst_rate(self):
+        from decimal import Decimal
+        return (self.gst_rate / Decimal('2')) if self.gst_rate else Decimal('0')
+
+    @property
+    def cgst_amount(self):
+        from decimal import Decimal
+        if self.invoice_id and self.invoice.is_inter_state:
+            return Decimal('0.00')
+        return (self.taxable_value * self.half_gst_rate / Decimal('100')).quantize(Decimal('0.01'))
+
+    @property
+    def sgst_amount(self):
+        return self.cgst_amount
+
+    @property
+    def igst_amount(self):
+        from decimal import Decimal
+        if self.invoice_id and self.invoice.is_inter_state:
+            return (self.taxable_value * self.gst_rate / Decimal('100')).quantize(Decimal('0.01'))
+        return Decimal('0.00')
+
+    @property
+    def line_total(self):
+        return self.taxable_value + self.cgst_amount + self.sgst_amount + self.igst_amount
 
 
 class AppSetting(models.Model):

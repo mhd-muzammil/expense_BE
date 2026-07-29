@@ -16,10 +16,10 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 
 from .models import (
-    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE,
+    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, AppSetting,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB,
 )
-from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer
+from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer
 
 
 # ---------------------------------------------------------------------------
@@ -1753,4 +1753,365 @@ class TaxInvoiceViewSet(viewsets.ModelViewSet):
         if search:
             qs = qs.filter(Q(ti_number__icontains=search) | Q(customer_name__icontains=search))
         return qs.order_by('-issue_date', '-created_at')
+
+
+# ---------------------------------------------------------------------------
+# Bank statement import (IDFC FIRST Bank / BOB)
+# ---------------------------------------------------------------------------
+# Users upload the bank's own Excel/CSV export; we auto-detect the header row
+# and map the (bank-specific) column names to canonical fields, tolerating the
+# many header spellings IDFC FIRST Bank and Bank of Baroda use.
+
+_BANK_MAX_ROWS = 50000
+
+
+def _smart_decode(raw):
+    """Decode file bytes to text, tolerating the various encodings banks emit."""
+    if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        try:
+            return raw.decode('utf-16')
+        except Exception:
+            pass
+    for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode('utf-8', errors='replace')
+
+
+def _parse_html_table(raw):
+    """Extract table rows from an HTML file OR a Microsoft XML-Spreadsheet file
+    (the 'Excel' many Indian bank portals actually export). Uses only the stdlib
+    html parser, so no extra dependency is required. Returns a list of row lists
+    (all tables/sheets flattened; the caller re-detects the real header row)."""
+    from html.parser import HTMLParser
+
+    text = _smart_decode(raw)
+
+    class _TableExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.rows = []
+            self.cur = None
+            self.buf = []
+            self.in_cell = False
+
+        def _base(self, tag):
+            return tag.lower().split(':')[-1]  # handles namespaced ss:Row / ss:Cell
+
+        def handle_starttag(self, tag, attrs):
+            base = self._base(tag)
+            if base in ('tr', 'row'):
+                self.cur = []
+            elif base in ('td', 'th', 'cell'):
+                self.in_cell = True
+                self.buf = []
+            elif base == 'br' and self.in_cell:
+                self.buf.append(' ')
+
+        def handle_startendtag(self, tag, attrs):
+            base = self._base(tag)
+            if base in ('td', 'th', 'cell') and self.cur is not None:
+                self.cur.append('')
+
+        def handle_endtag(self, tag):
+            base = self._base(tag)
+            if base in ('td', 'th', 'cell') and self.cur is not None and self.in_cell:
+                self.cur.append(' '.join(''.join(self.buf).split()))
+                self.in_cell = False
+            elif base in ('tr', 'row') and self.cur is not None:
+                self.rows.append(self.cur)
+                self.cur = None
+
+        def handle_data(self, data):
+            if self.in_cell:
+                self.buf.append(data)
+
+    p = _TableExtractor()
+    p.feed(text)
+    return [r for r in p.rows if any((str(c) or '').strip() for c in r)]
+
+
+def _read_tabular(file_obj):
+    """Read an uploaded bank export into a list of rows (each a list of cells).
+
+    Handles, in order: real .csv/.txt, real .xlsx (zip), HTML tables saved as
+    .xls/.xlsx (common with Indian bank portals), MS XML-Spreadsheet, and old
+    binary .xls (BIFF, if xlrd is available). Raises ValueError with a friendly
+    message otherwise."""
+    from io import BytesIO
+    fname = (file_obj.name or '').lower()
+    raw = file_obj.read()
+    if not raw:
+        raise ValueError('The uploaded file is empty.')
+
+    # 1) Plain CSV / TXT by extension.
+    if fname.endswith('.csv') or fname.endswith('.txt'):
+        return [row for row in csv.reader(_smart_decode(raw).splitlines())]
+
+    # 2) Real .xlsx (an OOXML zip). Try this first regardless of extension.
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True, read_only=True)
+        ws = wb.active
+        return [list(r) for r in ws.iter_rows(values_only=True)]
+    except Exception:
+        pass  # not a real .xlsx — fall through to the sniffers below
+
+    head = raw[:8192].lstrip().lower()
+
+    # 3) HTML table or MS XML-Spreadsheet ("Excel" that's really markup).
+    if (head[:1] == b'<' or b'<table' in head or b'<html' in head
+            or b'<tr' in head or b'spreadsheet' in head or b'<?xml' in head):
+        rows = _parse_html_table(raw)
+        if rows:
+            return rows
+
+    # 4) Old binary .xls (BIFF / OLE2), read with xlrd. Date-typed cells come
+    # back as Excel serial floats, so convert them to real datetimes here.
+    if raw[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+        try:
+            import xlrd
+            book = xlrd.open_workbook(file_contents=raw)
+            sh = book.sheet_by_index(0)
+            out = []
+            for r in range(sh.nrows):
+                row = []
+                for c in range(sh.ncols):
+                    cell = sh.cell(r, c)
+                    val = cell.value
+                    if cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            val = xlrd.xldate.xldate_as_datetime(val, book.datemode)
+                        except Exception:
+                            pass
+                    row.append(val)
+                out.append(row)
+            return out
+        except ImportError:
+            raise ValueError("This is an old .xls file. Open it in Excel and use "
+                             "'Save As' → 'Excel Workbook (.xlsx)' or 'CSV', then upload again.")
+        except Exception:
+            raise ValueError('Could not read this .xls file. Please re-save it as .xlsx or CSV and try again.')
+
+    # 5) Last resort: maybe it's delimited text with the wrong extension.
+    try:
+        text = _smart_decode(raw)
+        if ',' in text or '\t' in text:
+            rows = [row for row in csv.reader(text.splitlines())]
+            if rows:
+                return rows
+    except Exception:
+        pass
+
+    raise ValueError("Could not read the file. Please upload the bank's Excel (.xlsx) "
+                     "or CSV export. If it's a .xls, re-save it as .xlsx first.")
+
+
+def _match_bank_header(h):
+    """Map one raw header cell to a canonical bank-statement field, or None."""
+    h = str(h or '').strip().lower()
+    if not h:
+        return None
+    contains = lambda *subs: any(s in h for s in subs)
+    # Value date must be checked before the generic 'date' rule below.
+    if contains('value date', 'value dt'):
+        return 'value_date'
+    if contains('withdrawal', 'debit', 'paid out', 'amount debited') or h in ('dr', 'withdrawals', 'dr amount'):
+        return 'debit'
+    if contains('deposit', 'credit', 'paid in', 'amount credited') or h in ('cr', 'deposits', 'cr amount'):
+        return 'credit'
+    if contains('closing balance', 'running balance') or h == 'balance' or contains('balance'):
+        return 'balance'
+    if contains('narration', 'particular', 'description', 'remark', 'details', 'transaction detail'):
+        return 'narration'
+    if contains('chq', 'cheque', 'ref no', 'reference', 'instrument', 'utr'):
+        return 'ref_no'
+    if contains('date', 'txn dt', 'tran date', 'posting'):
+        return 'txn_date'
+    return None
+
+
+def _parse_bank_date(cell):
+    import datetime as dt
+    if cell is None or str(cell).strip() == '':
+        return None
+    if isinstance(cell, dt.datetime):
+        return cell.date()
+    if isinstance(cell, dt.date):
+        return cell
+    s = str(cell).strip().split(' ')[0]
+    for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%d/%m/%y', '%d-%m-%y', '%Y-%m-%d',
+                '%d-%b-%Y', '%d-%b-%y', '%d %b %Y', '%d/%b/%Y', '%d.%m.%Y', '%m/%d/%Y'):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_bank_amount(cell):
+    """Parse an amount cell → Decimal. Blank/'-'/None → 0. Tolerates commas,
+    currency prefixes, Cr/Dr suffixes and (parenthesised) negatives."""
+    if cell is None:
+        return Decimal('0')
+    if isinstance(cell, (int, float)):
+        return Decimal(str(cell))
+    s = str(cell).strip()
+    if s == '' or s in ('-', '.', 'nil', 'NIL', 'Nil'):
+        return Decimal('0')
+    neg = False
+    if s.startswith('(') and s.endswith(')'):
+        neg, s = True, s[1:-1]
+    su = s.upper()
+    for junk in ('CR', 'DR', 'INR', 'RS.', 'RS', '₹', ',', ' '):
+        su = su.replace(junk, '')
+    try:
+        from decimal import InvalidOperation
+        val = Decimal(su)
+    except Exception:
+        return Decimal('0')
+    return -val if neg else val
+
+
+def _import_bank_rows(rows, bank, source_file):
+    """Parse already-read rows into BankStatementEntry objects for `bank`.
+    Returns {inserted, skipped, errors}. Duplicate rows (same fingerprint) are
+    skipped so re-uploading the same statement is safe."""
+    import hashlib
+    result = {'inserted': 0, 'skipped': 0, 'errors': []}
+    if not rows:
+        result['errors'].append('The file is empty.')
+        return result
+
+    # 1) Locate the header row. The real transaction header always has a DATE
+    # column plus at least one money column; requiring the date lets us skip
+    # summary blocks like "Opening Balance | Total Debit | Total Credit | ..."
+    # that some banks (e.g. IDFC) print above the transaction table.
+    header_idx, col_map = None, {}
+    for i, row in enumerate(rows[:80]):
+        mapping = {}
+        for col_idx, cell in enumerate(row):
+            field = _match_bank_header(cell)
+            if field and field not in mapping.values():
+                mapping[col_idx] = field
+        vals = set(mapping.values())
+        if len(mapping) >= 3 and 'txn_date' in vals and (vals & {'debit', 'credit', 'balance'}):
+            header_idx, col_map = i, mapping
+            break
+    if header_idx is None:
+        result['errors'].append('Could not find the statement columns (Date / Narration / Debit / Credit / Balance). Please upload the bank\'s original Excel export.')
+        return result
+
+    # 2) Pre-load existing fingerprints for this bank to skip duplicates.
+    seen = set(BankStatementEntry.objects.filter(bank=bank).values_list('row_hash', flat=True))
+    to_create = []
+    data_rows = rows[header_idx + 1:_BANK_MAX_ROWS + header_idx + 1]
+    for row in data_rows:
+        if not any(c is not None and str(c).strip() != '' for c in row):
+            continue
+        get = lambda field: next((row[ci] for ci, f in col_map.items() if f == field and ci < len(row)), None)
+        txn_date = _parse_bank_date(get('txn_date'))
+        debit = _parse_bank_amount(get('debit'))
+        credit = _parse_bank_amount(get('credit'))
+        narration = str(get('narration') or '').strip()
+        # Every real transaction row carries a date; dateless rows are repeated
+        # headers, blank separators or "Total"/summary footers — skip them.
+        if txn_date is None:
+            continue
+        # A dated row with no money and no narration is a summary/blank footer
+        # line (e.g. the closing-balance row), not a real transaction.
+        if debit == 0 and credit == 0 and not narration:
+            continue
+        bal_raw = get('balance')
+        balance = None if (bal_raw is None or str(bal_raw).strip() == '') else _parse_bank_amount(bal_raw)
+        balance_dc = ''
+        if bal_raw is not None:
+            _bs = str(bal_raw).strip().upper()
+            if _bs.endswith('CR'):
+                balance_dc = 'Cr'
+            elif _bs.endswith('DR'):
+                balance_dc = 'Dr'
+        ref_no = str(get('ref_no') or '').strip()[:150]
+        value_date = _parse_bank_date(get('value_date'))
+
+        fingerprint = f"{bank}|{txn_date}|{narration}|{debit}|{credit}|{balance}|{ref_no}"
+        row_hash = hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()
+        if row_hash in seen:
+            result['skipped'] += 1
+            continue
+        seen.add(row_hash)
+        to_create.append(BankStatementEntry(
+            bank=bank, txn_date=txn_date, value_date=value_date, narration=narration,
+            ref_no=ref_no, debit=debit, credit=credit, balance=balance, balance_dc=balance_dc,
+            source_file=source_file[:255], row_hash=row_hash,
+        ))
+
+    if to_create:
+        BankStatementEntry.objects.bulk_create(to_create)
+        result['inserted'] = len(to_create)
+    elif result['skipped'] == 0:
+        result['errors'].append('No transaction rows were found below the header.')
+    return result
+
+
+class _BankStatementViewSet(viewsets.ModelViewSet):
+    """Base viewset for a single bank's statement entries. Subclasses set
+    `bank` and the section permission."""
+    serializer_class = BankStatementEntrySerializer
+    pagination_class = None
+    bank = None
+
+    def get_queryset(self):
+        qs = BankStatementEntry.objects.filter(bank=self.bank)
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(Q(narration__icontains=search) | Q(ref_no__icontains=search))
+        # Optional transaction-date range filter (YYYY-MM-DD).
+        date_from = self.request.query_params.get('from')
+        date_to = self.request.query_params.get('to')
+        if date_from:
+            qs = qs.filter(txn_date__gte=date_from)
+        if date_to:
+            qs = qs.filter(txn_date__lte=date_to)
+        # Show the most recent transactions first (newest date on top),
+        # keeping each day's rows in their original file order. Works whether
+        # the source file was exported oldest-first (IDFC) or newest-first (BOB).
+        return qs.order_by('-txn_date', 'id')
+
+    @action(detail=False, methods=['post'], url_path='import')
+    def import_statement(self, request):
+        file_obj = request.FILES.get('file')
+        if not file_obj:
+            return Response({'detail': 'No file was uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            rows = _read_tabular(file_obj)
+        except ValueError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        res = _import_bank_rows(rows, self.bank, file_obj.name)
+        if res['inserted'] == 0 and res['errors']:
+            return Response({'detail': res['errors'][0], **res}, status=status.HTTP_400_BAD_REQUEST)
+        parts = [f"Imported {res['inserted']} entr{'y' if res['inserted'] == 1 else 'ies'}"]
+        if res['skipped']:
+            parts.append(f"skipped {res['skipped']} duplicate row(s)")
+        res['detail'] = ', '.join(parts) + '.'
+        return Response(res, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['delete'], url_path='clear')
+    def clear(self, request):
+        n, _ = BankStatementEntry.objects.filter(bank=self.bank).delete()
+        return Response({'detail': f'Cleared {n} entries.', 'deleted': n})
+
+
+class IDFCStatementViewSet(_BankStatementViewSet):
+    """IDFC FIRST Bank statement entries + Excel import."""
+    bank = BankStatementEntry.BANK_IDFC
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_IDFC)]
+
+
+class BOBStatementViewSet(_BankStatementViewSet):
+    """Bank of Baroda statement entries + Excel import."""
+    bank = BankStatementEntry.BANK_BOB
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_BOB)]
 

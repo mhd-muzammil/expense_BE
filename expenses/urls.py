@@ -14,6 +14,8 @@ router.register(r'payment-receipts', views.PaymentReceiptViewSet, basename='paym
 router.register(r'quotes', views.QuoteViewSet, basename='quote')
 router.register(r'bills-of-supply', views.BillOfSupplyViewSet, basename='bill-of-supply')
 router.register(r'tax-invoices', views.TaxInvoiceViewSet, basename='tax-invoice')
+router.register(r'idfc-statements', views.IDFCStatementViewSet, basename='idfc-statement')
+router.register(r'bob-statements', views.BOBStatementViewSet, basename='bob-statement')
 
 urlpatterns = [
     path('', include(router.urls)),

@@ -1,6 +1,6 @@
 from decimal import Decimal
 from rest_framework import serializers
-from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem
+from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry
 
 
 class BranchSerializer(serializers.ModelSerializer):
@@ -715,4 +715,17 @@ class TaxInvoiceSerializer(serializers.ModelSerializer):
         fy_start = today.year if today.month >= 4 else today.year - 1
         fy = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
         return next_document_number(TaxInvoice, 'ti_number', f"RT{fy}-SER-", 12)
+
+
+class BankStatementEntrySerializer(serializers.ModelSerializer):
+    """Read-only-ish view of one imported bank-statement transaction row."""
+    bank_display = serializers.CharField(source='get_bank_display', read_only=True)
+
+    class Meta:
+        model = BankStatementEntry
+        fields = [
+            'id', 'bank', 'bank_display', 'txn_date', 'value_date', 'narration',
+            'ref_no', 'debit', 'credit', 'balance', 'balance_dc', 'source_file', 'uploaded_at',
+        ]
+        read_only_fields = ['uploaded_at']
 

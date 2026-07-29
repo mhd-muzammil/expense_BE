@@ -19,8 +19,10 @@ SECTION_PETTYCASH = 'pettycash'
 SECTION_QUOTE = 'quote'
 SECTION_BOS = 'bos'
 SECTION_TAXINVOICE = 'taxinvoice'
+SECTION_IDFC = 'idfc'
+SECTION_BOB = 'bob'
 
-ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE]
+ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB]
 
 SECTION_LABELS = {
     SECTION_DASHBOARD: 'Dashboard',
@@ -36,6 +38,8 @@ SECTION_LABELS = {
     SECTION_QUOTE: 'Quote',
     SECTION_BOS: 'Bill of Supply',
     SECTION_TAXINVOICE: 'Tax Invoice',
+    SECTION_IDFC: 'HDFC Statement',
+    SECTION_BOB: 'BOB Statement',
 }
 
 # Our own company's GST state code (Tamil Nadu). A supply to a different state
@@ -1053,5 +1057,37 @@ class AppSetting(models.Model):
     @property
     def clear_password_is_set(self):
         return bool(self.clear_data_password)
+
+
+class BankStatementEntry(models.Model):
+    """A single transaction row parsed from an uploaded bank statement.
+    Two banks are supported as separate sections: IDFC FIRST Bank and Bank of
+    Baroda (BOB). Rows are imported from the bank's own Excel/CSV export."""
+    BANK_IDFC = 'idfc'
+    BANK_BOB = 'bob'
+    BANK_CHOICES = [(BANK_IDFC, 'HDFC Statement'), (BANK_BOB, 'Bank of Baroda')]
+
+    bank = models.CharField(max_length=10, choices=BANK_CHOICES, db_index=True)
+    txn_date = models.DateField(null=True, blank=True)
+    value_date = models.DateField(null=True, blank=True)
+    narration = models.TextField(blank=True, default='')
+    ref_no = models.CharField(max_length=150, blank=True, default='')
+    debit = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    credit = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    balance = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    # 'Cr' / 'Dr' indicator that banks print next to the running balance.
+    balance_dc = models.CharField(max_length=2, blank=True, default='')
+    source_file = models.CharField(max_length=255, blank=True, default='')
+    # Fingerprint of the row (bank + date + narration + amounts + balance) used to
+    # skip duplicates when the same statement file is uploaded more than once.
+    row_hash = models.CharField(max_length=64, blank=True, default='', db_index=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-txn_date', '-id']
+        verbose_name_plural = 'Bank statement entries'
+
+    def __str__(self):
+        return f"{self.get_bank_display()} {self.txn_date} {self.narration[:30]}"
 
 

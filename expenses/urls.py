@@ -21,6 +21,7 @@ urlpatterns = [
     path('', include(router.urls)),
     path('dashboard/', views.dashboard_view, name='dashboard'),
     path('petty-cash/summary/', views.petty_cash_summary, name='petty-cash-summary'),
+    path('petty-cash/export/', views.export_petty_cash, name='petty-cash-export'),
     path('export/', views.export_expenses, name='export'),
     path('import/', views.import_expenses, name='import'),
     path('categories/', views.categories_view, name='categories'),

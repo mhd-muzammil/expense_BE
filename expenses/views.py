@@ -1614,6 +1614,95 @@ def petty_cash_summary(request):
     })
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireAnySection(SECTION_EXPENSES, SECTION_PETTYCASH)])
+def export_petty_cash(request):
+    """Export the petty cash ledger (credits from petty expenses + cash debits)
+    as Excel or CSV, honouring the branch / date-range filters. Each row carries
+    a running balance and a TOTAL line is appended."""
+    credits_qs = Expense.objects.filter(category__icontains='petty').select_related('branch')
+    debits_qs = PettyCashDebit.objects.select_related('branch').all()
+
+    branch_val = request.query_params.get('branch')
+    if branch_val:
+        if branch_val.isdigit():
+            credits_qs = credits_qs.filter(branch_id=branch_val)
+            debits_qs = debits_qs.filter(branch_id=branch_val)
+        else:
+            credits_qs = credits_qs.filter(branch__location__icontains=branch_val)
+            debits_qs = debits_qs.filter(branch__location__icontains=branch_val)
+    date_from = request.query_params.get('date_from')
+    date_to = request.query_params.get('date_to')
+    if date_from:
+        credits_qs = credits_qs.filter(date__gte=date_from)
+        debits_qs = debits_qs.filter(date__gte=date_from)
+    if date_to:
+        credits_qs = credits_qs.filter(date__lte=date_to)
+        debits_qs = debits_qs.filter(date__lte=date_to)
+
+    # Merge credits and debits into one chronological ledger.
+    rows = []
+    for e in credits_qs:
+        amt = (e.credited_amount or Decimal('0.00')) + (e.debited_amount or Decimal('0.00'))
+        rows.append({'date': e.date, 'type': 'Credit', 'amount': amt,
+                     'remark': e.credit_remark or e.debit_remark or '',
+                     'person': e.credit_person or e.debit_person or '',
+                     'branch': e.branch.location if e.branch else ''})
+    for d in debits_qs:
+        rows.append({'date': d.date, 'type': 'Debit', 'amount': d.amount or Decimal('0.00'),
+                     'remark': d.remark or '', 'person': d.person or '',
+                     'branch': d.branch.location if d.branch else ''})
+    rows.sort(key=lambda r: (r['date'], 0 if r['type'] == 'Credit' else 1))
+
+    running = Decimal('0.00')
+    ledger = []
+    for i, r in enumerate(rows, 1):
+        running += r['amount'] if r['type'] == 'Credit' else -r['amount']
+        ledger.append((i, r, running))
+
+    total_credits = sum((r['amount'] for r in rows if r['type'] == 'Credit'), Decimal('0.00'))
+    total_debits = sum((r['amount'] for r in rows if r['type'] == 'Debit'), Decimal('0.00'))
+    balance = total_credits - total_debits
+
+    headers = ['S.No', 'Date', 'Type', 'Credit (In)', 'Debit (Out)', 'Remark', 'Person', 'Branch', 'Balance']
+
+    def row_values(i, r, run):
+        credit_in = float(r['amount']) if r['type'] == 'Credit' else ''
+        debit_out = float(r['amount']) if r['type'] == 'Debit' else ''
+        return [i, r['date'].strftime('%Y-%m-%d'), r['type'], credit_in, debit_out,
+                r['remark'], r['person'], r['branch'], float(run)]
+
+    total_row = ['', '', 'TOTAL', float(total_credits), float(total_debits), '', '', '', float(balance)]
+
+    if request.query_params.get('type', 'excel') == 'excel':
+        try:
+            import openpyxl
+        except ImportError:
+            return Response({'error': 'openpyxl not installed for Excel export'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        wb = openpyxl.Workbook(); ws = wb.active; ws.title = 'Petty Cash'
+        ws.append(headers)
+        for i, r, run in ledger:
+            ws.append(row_values(i, r, run))
+        ws.append([])
+        ws.append(total_row)
+        buf = BytesIO(); wb.save(buf); buf.seek(0)
+        resp = HttpResponse(buf.getvalue(),
+                            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        resp['Content-Disposition'] = 'attachment; filename="petty-cash.xlsx"'
+        return resp
+
+    resp = HttpResponse(content_type='text/csv')
+    resp['Content-Disposition'] = 'attachment; filename="petty-cash.csv"'
+    writer = csv.writer(resp)
+    writer.writerow(headers)
+    for i, r, run in ledger:
+        writer.writerow(row_values(i, r, run))
+    writer.writerow([])
+    writer.writerow(total_row)
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Invoices
 # ---------------------------------------------------------------------------
@@ -2048,6 +2137,13 @@ def _import_bank_rows(rows, bank, source_file):
             source_file=source_file[:255], row_hash=row_hash,
         ))
 
+    # Normalise stored order to oldest→newest so ascending id == chronological
+    # order, whether the bank exported newest-first (BOB) or oldest-first (IDFC).
+    # The list view then uses -id to surface the latest transaction on top and
+    # to read the true current balance off the most recent row.
+    dated = [e.txn_date for e in to_create if e.txn_date]
+    if len(dated) >= 2 and dated[0] > dated[-1]:
+        to_create.reverse()
     if to_create:
         BankStatementEntry.objects.bulk_create(to_create)
         result['inserted'] = len(to_create)
@@ -2075,10 +2171,10 @@ class _BankStatementViewSet(viewsets.ModelViewSet):
             qs = qs.filter(txn_date__gte=date_from)
         if date_to:
             qs = qs.filter(txn_date__lte=date_to)
-        # Show the most recent transactions first (newest date on top),
-        # keeping each day's rows in their original file order. Works whether
-        # the source file was exported oldest-first (IDFC) or newest-first (BOB).
-        return qs.order_by('-txn_date', 'id')
+        # Most recent transactions first. Storage is normalised to oldest→newest
+        # at import, so -id reliably surfaces the latest transaction of each day
+        # on top (and lets the UI read the current balance off the first row).
+        return qs.order_by('-txn_date', '-id')
 
     @action(detail=False, methods=['post'], url_path='import')
     def import_statement(self, request):

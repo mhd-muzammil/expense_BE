@@ -38,7 +38,7 @@ SECTION_LABELS = {
     SECTION_QUOTE: 'Quote',
     SECTION_BOS: 'Bill of Supply',
     SECTION_TAXINVOICE: 'Tax Invoice',
-    SECTION_IDFC: 'HDFC Statement',
+    SECTION_IDFC: 'IDFC Statement',
     SECTION_BOB: 'BOB Statement',
 }
 
@@ -1065,7 +1065,7 @@ class BankStatementEntry(models.Model):
     Baroda (BOB). Rows are imported from the bank's own Excel/CSV export."""
     BANK_IDFC = 'idfc'
     BANK_BOB = 'bob'
-    BANK_CHOICES = [(BANK_IDFC, 'HDFC Statement'), (BANK_BOB, 'Bank of Baroda')]
+    BANK_CHOICES = [(BANK_IDFC, 'IDFC FIRST Bank'), (BANK_BOB, 'Bank of Baroda')]
 
     bank = models.CharField(max_length=10, choices=BANK_CHOICES, db_index=True)
     txn_date = models.DateField(null=True, blank=True)

@@ -1,6 +1,6 @@
 from decimal import Decimal
 from rest_framework import serializers
-from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry
+from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry, EngineerPnl
 
 
 class BranchSerializer(serializers.ModelSerializer):
@@ -728,4 +728,22 @@ class BankStatementEntrySerializer(serializers.ModelSerializer):
             'ref_no', 'debit', 'credit', 'balance', 'balance_dc', 'source_file', 'uploaded_at',
         ]
         read_only_fields = ['uploaded_at']
+
+
+class EngineerPnlSerializer(serializers.ModelSerializer):
+    """CRUD for a single engineer's P&L parameters. The live closed-call count
+    and derived money figures are added by the viewset's /board/ action."""
+    per_day = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EngineerPnl
+        fields = [
+            'id', 'engineer_name', 'email', 'engg_count', 'per_day_target',
+            'per_call_rate', 'engg_salary', 'total_working_days', 'actual_working_days',
+            'active', 'position', 'per_day', 'created_at',
+        ]
+        read_only_fields = ['created_at']
+
+    def get_per_day(self, obj):
+        return str(obj.per_day)
 

@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.conf import settings
 from django.db import models
 
@@ -21,8 +23,9 @@ SECTION_BOS = 'bos'
 SECTION_TAXINVOICE = 'taxinvoice'
 SECTION_IDFC = 'idfc'
 SECTION_BOB = 'bob'
+SECTION_ENGPNL = 'engpnl'
 
-ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB]
+ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL]
 
 SECTION_LABELS = {
     SECTION_DASHBOARD: 'Dashboard',
@@ -40,6 +43,7 @@ SECTION_LABELS = {
     SECTION_TAXINVOICE: 'Tax Invoice',
     SECTION_IDFC: 'IDFC Statement',
     SECTION_BOB: 'BOB Statement',
+    SECTION_ENGPNL: 'Engineer P&L',
 }
 
 # Our own company's GST state code (Tamil Nadu). A supply to a different state
@@ -1089,5 +1093,63 @@ class BankStatementEntry(models.Model):
 
     def __str__(self):
         return f"{self.get_bank_display()} {self.txn_date} {self.narration[:30]}"
+
+
+class EngineerPnl(models.Model):
+    """Per-engineer profit & loss configuration for the live Engineer P&L board.
+
+    The number of closed calls is pulled LIVE from the OpenCall system (matched
+    by email, falling back to name); every other field here is an editable P&L
+    parameter. All money figures are derived in `compute()` from the live
+    closed-call count so the board reflects real-time profit/loss."""
+    engineer_name = models.CharField(max_length=200)
+    # Match key to the OpenCall system — email is unique & stable (name is a fallback).
+    email = models.EmailField(blank=True, default='')
+    engg_count = models.PositiveIntegerField(default=1)
+    per_day_target = models.PositiveIntegerField(default=10)
+    per_call_rate = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('350'))
+    engg_salary = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('25000'))
+    total_working_days = models.PositiveIntegerField(default=30)
+    actual_working_days = models.PositiveIntegerField(default=25)
+    active = models.BooleanField(default=True)
+    position = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['position', 'id']
+
+    def __str__(self):
+        return self.engineer_name
+
+    @property
+    def per_day(self):
+        if not self.total_working_days:
+            return Decimal('0.00')
+        return (self.engg_salary / self.total_working_days).quantize(Decimal('0.01'))
+
+    def compute(self, closed_calls, period_days=None):
+        """Live P&L figures given the (live) closed-call count for the window.
+        Revenue = closed × per-call-rate. Salary is prorated to the selected
+        window (per-day rate × number of days) so a single-day ("today") view
+        compares like-for-like; pass period_days=None for the full monthly salary."""
+        closed = Decimal(str(closed_calls or 0))
+        awd = self.actual_working_days or 0
+        actual_closed_pd = (closed / awd).quantize(Decimal('0.01')) if awd else Decimal('0.00')
+        revenue = (closed * self.per_call_rate).quantize(Decimal('0.01'))
+        if period_days is None:
+            total_salary = self.engg_salary
+        else:
+            total_salary = (self.per_day * Decimal(str(period_days))).quantize(Decimal('0.01'))
+        nett = (revenue - total_salary).quantize(Decimal('0.01'))
+        return {
+            'closed_calls': int(closed),
+            'actual_closed_pd': str(actual_closed_pd),
+            'total_calls_closed_pm': int(closed),
+            'per_day': str(self.per_day),
+            'revenue': str(revenue),
+            'total_engg_salary': str(total_salary),
+            'nett': str(nett),
+        }
 
 

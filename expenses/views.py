@@ -16,10 +16,10 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 
 from .models import (
-    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB,
+    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, AppSetting,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL,
 )
-from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer
+from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer
 
 
 # ---------------------------------------------------------------------------
@@ -2210,4 +2210,177 @@ class BOBStatementViewSet(_BankStatementViewSet):
     """Bank of Baroda statement entries + Excel import."""
     bank = BankStatementEntry.BANK_BOB
     permission_classes = [IsAuthenticated, RequireSection(SECTION_BOB)]
+
+
+# ---------------------------------------------------------------------------
+# Engineer P&L — live profit/loss per engineer, closed-calls pulled from OpenCall
+# ---------------------------------------------------------------------------
+class EngineerPnlViewSet(viewsets.ModelViewSet):
+    """CRUD for each engineer's P&L parameters, plus a live ``/board/`` action
+    that pulls the closed-call count per engineer from the OpenCall system and
+    computes Revenue / Nett in real time. The board degrades gracefully: if
+    OpenCall is unreachable or unconfigured it still returns every engineer with
+    closed = 0 and a ``live_ok: false`` flag, so the section never breaks."""
+    queryset = EngineerPnl.objects.all()
+    serializer_class = EngineerPnlSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_ENGPNL)]
+
+    def get_queryset(self):
+        return EngineerPnl.objects.all().order_by('position', 'id')
+
+    @action(detail=False, methods=['get'])
+    def board(self, request):
+        from datetime import date
+        import calendar
+        from . import opencall_client
+
+        # Resolve the window. Priority: explicit from/to range → month → current
+        # calendar month (the live default). from/to are YYYY-MM-DD.
+        month = request.query_params.get('month')     # 'YYYY-MM'
+        q_from = request.query_params.get('from')     # 'YYYY-MM-DD'
+        q_to = request.query_params.get('to')
+        try:
+            if q_from and q_to:
+                first = date.fromisoformat(q_from)
+                last = date.fromisoformat(q_to)
+                if first > last:
+                    first, last = last, first
+                year, mon = first.year, first.month
+            elif month:
+                year, mon = int(month[:4]), int(month[5:7])
+                first = date(year, mon, 1)
+                last = date(year, mon, calendar.monthrange(year, mon)[1])
+            else:
+                # Default view = today only (the live current-day board).
+                today = date.today()
+                first = last = today
+                year, mon = today.year, today.month
+        except (ValueError, IndexError):
+            return Response({'detail': 'Invalid date range.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        period_days = (last - first).days + 1
+
+        # Auto-populate engineers from OpenCall's roster so they appear without
+        # manual entry. Non-destructive: only creates names never seen before
+        # (a soft-hidden engineer — active=False — is NOT recreated). Best-effort.
+        synced = 0
+        if request.query_params.get('sync', '1') != '0':
+            try:
+                roster = opencall_client.get_engineers()
+                known = {e.engineer_name.strip().lower() for e in EngineerPnl.objects.all()}
+                to_add = []
+                for oc in roster:
+                    if oc['active'] and oc['name'].lower() not in known:
+                        to_add.append(EngineerPnl(engineer_name=oc['name'], email=oc.get('email', '') or ''))
+                        known.add(oc['name'].lower())
+                if to_add:
+                    EngineerPnl.objects.bulk_create(to_add)
+                    synced = len(to_add)
+            except Exception:
+                pass  # roster sync is best-effort; never break the board
+
+        engineers = list(self.get_queryset().filter(active=True))
+
+        # Pull real salary from the Payroll system and apply it to matched
+        # engineers (email first, then name). Payroll is the source of truth for
+        # salary when a match exists; best-effort so it never breaks the board.
+        payroll_ok, payroll_message = None, ''
+        salary_source = {}  # engineer id -> 'payroll' | 'manual'
+        try:
+            from . import payroll_client
+            if payroll_client.is_configured():
+                sal = payroll_client.get_salaries()
+                to_update = []
+                for eng in engineers:
+                    email_key = (eng.email or '').strip().lower()
+                    name_key = eng.engineer_name.strip().lower()
+                    match = sal['by_email'].get(email_key) if email_key else None
+                    if match is None:
+                        match = sal['by_name'].get(name_key)
+                    if match is not None:
+                        salary_source[eng.id] = 'payroll'
+                        new_sal = Decimal(str(match)).quantize(Decimal('0.01'))
+                        if eng.engg_salary != new_sal:
+                            eng.engg_salary = new_sal
+                            to_update.append(eng)
+                if to_update:
+                    EngineerPnl.objects.bulk_update(to_update, ['engg_salary'])
+                payroll_ok = True
+            else:
+                payroll_ok = False
+                payroll_message = 'Payroll credentials not set (PAYROLL_USERNAME / PAYROLL_PASSWORD).'
+        except Exception as e:
+            payroll_ok = False
+            payroll_message = f'Could not reach Payroll: {e}'
+
+        # Live pull of closed-call counts (name-keyed, case-insensitive).
+        live_ok, message, counts, display, meta = True, '', {}, {}, {}
+        try:
+            res = opencall_client.get_closed_counts(first.isoformat(), last.isoformat())
+            counts, display, meta = res['counts'], res['display'], res['meta']
+        except opencall_client.OpenCallError as e:
+            live_ok, message = False, str(e)
+        except Exception as e:  # network/timeout etc. — never break the page
+            live_ok, message = False, f'Could not reach OpenCall: {e}'
+
+        configured_keys = {e.engineer_name.strip().lower() for e in engineers}
+        all_rows = []
+        for eng in engineers:
+            closed = int(counts.get(eng.engineer_name.strip().lower(), 0))
+            calc = eng.compute(closed, period_days)
+            all_rows.append({
+                'id': eng.id,
+                'engineer_name': eng.engineer_name,
+                'email': eng.email,
+                'engg_count': eng.engg_count,
+                'per_day_target': eng.per_day_target,
+                'per_call_rate': str(eng.per_call_rate),
+                'engg_salary': str(eng.engg_salary),
+                'total_working_days': eng.total_working_days,
+                'actual_working_days': eng.actual_working_days,
+                'salary_source': salary_source.get(eng.id, 'manual'),
+                **calc,
+            })
+
+        # Default = only engineers WITH data (closed calls) in the window; the
+        # "Overall" view (?all=1) shows every configured engineer. When OpenCall
+        # is offline we can't tell who has data, so fall back to showing all.
+        show_all = request.query_params.get('all') == '1'
+        rows = all_rows if (show_all or not live_ok) else [r for r in all_rows if r['closed_calls'] > 0]
+
+        tot_engg = sum(r['engg_count'] for r in rows)
+        tot_closed = sum(r['closed_calls'] for r in rows)
+        tot_rev = sum((Decimal(r['revenue']) for r in rows), Decimal('0.00'))
+        tot_sal = sum((Decimal(r['total_engg_salary']) for r in rows), Decimal('0.00'))
+        tot_nett = sum((Decimal(r['nett']) for r in rows), Decimal('0.00'))
+
+        # Engineers OpenCall reports that aren't configured here yet (so the user
+        # can add them and start earning revenue for their closes).
+        unmatched = sorted(
+            [{'engineer_name': display[k], 'closed_calls': counts[k]}
+             for k in counts if k not in configured_keys],
+            key=lambda x: -x['closed_calls'],
+        )
+
+        return Response({
+            'period': {'month': f'{year:04d}-{mon:02d}', 'from': first.isoformat(), 'to': last.isoformat()},
+            'live_ok': live_ok,
+            'message': message,
+            'synced': synced,
+            'payroll_ok': payroll_ok,
+            'payroll_message': payroll_message,
+            'show_all': show_all,
+            'total_configured': len(all_rows),
+            'meta': meta,
+            'rows': rows,
+            'totals': {
+                'engg_count': tot_engg,
+                'closed_calls': tot_closed,
+                'revenue': str(tot_rev),
+                'total_engg_salary': str(tot_sal),
+                'nett': str(tot_nett),
+            },
+            'unmatched_engineers': unmatched,
+        })
 

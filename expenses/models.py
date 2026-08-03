@@ -1129,27 +1129,28 @@ class EngineerPnl(models.Model):
         return (self.engg_salary / self.total_working_days).quantize(Decimal('0.01'))
 
     def compute(self, closed_calls, period_days=None):
-        """Live P&L figures given the (live) closed-call count for the window.
-        Revenue = closed × per-call-rate. Salary is prorated to the selected
-        window (per-day rate × number of days) so a single-day ("today") view
-        compares like-for-like; pass period_days=None for the full monthly salary."""
+        """Live P&L figures for the window.
+
+        Engg Earning = closed calls × per-call-rate.
+        Profit/Loss  = Engg Earning − one-day salary (engg salary ÷ total working
+        days). period_days is kept for call-signature compatibility but no longer
+        changes the figures."""
         closed = Decimal(str(closed_calls or 0))
         awd = self.actual_working_days or 0
         actual_closed_pd = (closed / awd).quantize(Decimal('0.01')) if awd else Decimal('0.00')
-        revenue = (closed * self.per_call_rate).quantize(Decimal('0.01'))
-        if period_days is None:
-            total_salary = self.engg_salary
-        else:
-            total_salary = (self.per_day * Decimal(str(period_days))).quantize(Decimal('0.01'))
-        nett = (revenue - total_salary).quantize(Decimal('0.01'))
+        engg_earning = (closed * self.per_call_rate).quantize(Decimal('0.01'))
+        one_day_salary = self.per_day
+        profit_loss = (engg_earning - one_day_salary).quantize(Decimal('0.01'))
         return {
             'closed_calls': int(closed),
             'actual_closed_pd': str(actual_closed_pd),
             'total_calls_closed_pm': int(closed),
-            'per_day': str(self.per_day),
-            'revenue': str(revenue),
-            'total_engg_salary': str(total_salary),
-            'nett': str(nett),
+            'per_day': str(one_day_salary),
+            'engg_earning': str(engg_earning),
+            'revenue': str(engg_earning),               # alias (Engg Earning)
+            'total_engg_salary': str(self.engg_salary),
+            'profit_loss': str(profit_loss),
+            'nett': str(profit_loss),                    # alias (Profit/Loss)
         }
 
 

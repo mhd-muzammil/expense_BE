@@ -2143,6 +2143,35 @@ def _parse_bank_amount(cell):
     return -val if neg else val
 
 
+def _bank_norm_text(s):
+    """Collapse whitespace + upper-case so trivial formatting differences in a
+    bank's re-export (extra spaces, case) don't defeat duplicate detection."""
+    return ' '.join(str(s or '').split()).upper()
+
+
+def _bank_norm_amount(amount):
+    """Canonical 2-decimal string for an amount so 100 / 100.0 / 100.00 all
+    match. None (blank balance) → ''."""
+    if amount is None:
+        return ''
+    try:
+        return str(Decimal(amount).quantize(Decimal('0.01')))
+    except Exception:
+        return str(amount)
+
+
+def _bank_fingerprint(bank, txn_date, narration, debit, credit, balance, ref_no):
+    """Stable per-row fingerprint used for duplicate detection. Computed the SAME
+    way for existing DB rows and freshly-parsed rows, so re-uploading a statement
+    (even one that overlaps earlier dates, or was re-exported with slightly
+    different spacing) never creates duplicates."""
+    return (
+        f"{bank}|{txn_date}|{_bank_norm_text(narration)}|"
+        f"{_bank_norm_amount(debit)}|{_bank_norm_amount(credit)}|"
+        f"{_bank_norm_amount(balance)}|{_bank_norm_text(ref_no)}"
+    )
+
+
 def _import_bank_rows(rows, bank, source_file):
     """Parse already-read rows into BankStatementEntry objects for `bank`.
     Returns {inserted, skipped, errors}. Duplicate rows (same fingerprint) are
@@ -2173,7 +2202,17 @@ def _import_bank_rows(rows, bank, source_file):
         return result
 
     # 2) Pre-load existing fingerprints for this bank to skip duplicates.
-    seen = set(BankStatementEntry.objects.filter(bank=bank).values_list('row_hash', flat=True))
+    # Recompute each existing row's fingerprint from its FIELDS (not the stored
+    # row_hash) so dedup stays consistent even for rows saved under an older hash
+    # formula — this makes the very next import safe, with no data migration.
+    seen = set()
+    for e in BankStatementEntry.objects.filter(bank=bank).values(
+        'txn_date', 'narration', 'debit', 'credit', 'balance', 'ref_no'
+    ):
+        seen.add(_bank_fingerprint(
+            bank, e['txn_date'], e['narration'], e['debit'], e['credit'],
+            e['balance'], e['ref_no'],
+        ))
     to_create = []
     data_rows = rows[header_idx + 1:_BANK_MAX_ROWS + header_idx + 1]
     for row in data_rows:
@@ -2204,12 +2243,12 @@ def _import_bank_rows(rows, bank, source_file):
         ref_no = str(get('ref_no') or '').strip()[:150]
         value_date = _parse_bank_date(get('value_date'))
 
-        fingerprint = f"{bank}|{txn_date}|{narration}|{debit}|{credit}|{balance}|{ref_no}"
+        fingerprint = _bank_fingerprint(bank, txn_date, narration, debit, credit, balance, ref_no)
         row_hash = hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()
-        if row_hash in seen:
+        if fingerprint in seen:
             result['skipped'] += 1
             continue
-        seen.add(row_hash)
+        seen.add(fingerprint)
         to_create.append(BankStatementEntry(
             bank=bank, txn_date=txn_date, value_date=value_date, narration=narration,
             ref_no=ref_no, debit=debit, credit=credit, balance=balance, balance_dc=balance_dc,

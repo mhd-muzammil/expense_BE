@@ -30,6 +30,7 @@ urlpatterns = [
     path('payment-mode-balances/', views.payment_mode_balances_view, name='payment-mode-balances'),
     path('payment-mode-balances/set/', views.payment_mode_balance_set, name='payment-mode-balance-set'),
     path('payment-mode-balances/delete/', views.payment_mode_balance_delete, name='payment-mode-balance-delete'),
+    path('payment-mode-balances/rename/', views.payment_mode_balance_rename, name='payment-mode-balance-rename'),
     # Billing Reminders
     path('billing-reminders/', views.billing_reminders_list, name='billing-reminders-list'),
     path('billing-reminders/create/', views.billing_reminder_create, name='billing-reminder-create'),

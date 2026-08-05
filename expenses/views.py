@@ -188,6 +188,11 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         if date_to:
             qs = qs.filter(date__lte=date_to)
 
+        # Filter by payment mode (matches entries whose credit OR debit mode is it)
+        mode = self.request.query_params.get('payment_mode')
+        if mode:
+            qs = qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
+
         # Search
         search = self.request.query_params.get('search')
         if search:
@@ -316,16 +321,27 @@ def dashboard_view(request):
     if date_to:
         qs = qs.filter(date__lte=date_to)
 
+    mode = request.query_params.get('payment_mode')
+    if mode:
+        qs = qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
+
     totals = qs.aggregate(
         total_credits=Coalesce(Sum('credited_amount'), Decimal('0.00')),
         total_debits=Coalesce(Sum('debited_amount'), Decimal('0.00')),
     )
-    
-    # Total Balance is the sum of all Payment Mode balances (Company-wide absolute balance)
-    total_initial = PaymentModeBalance.objects.aggregate(t=Coalesce(Sum('initial_balance'), Decimal('0.00')))['t']
-    global_credits = Expense.objects.aggregate(t=Coalesce(Sum('credited_amount'), Decimal('0.00')))['t']
-    global_debits = Expense.objects.aggregate(t=Coalesce(Sum('debited_amount'), Decimal('0.00')))['t']
-    total_balance = total_initial + global_credits - global_debits
+
+    if mode:
+        # Balance of the selected payment mode (all-time, cumulative).
+        mode_initial = PaymentModeBalance.objects.filter(payment_mode__iexact=mode).aggregate(t=Coalesce(Sum('initial_balance'), Decimal('0.00')))['t']
+        mode_credits = Expense.objects.filter(credit_payment_mode__iexact=mode).aggregate(t=Coalesce(Sum('credited_amount'), Decimal('0.00')))['t']
+        mode_debits = Expense.objects.filter(debit_payment_mode__iexact=mode).aggregate(t=Coalesce(Sum('debited_amount'), Decimal('0.00')))['t']
+        total_balance = mode_initial + mode_credits - mode_debits
+    else:
+        # Total Balance is the sum of all Payment Mode balances (company-wide).
+        total_initial = PaymentModeBalance.objects.aggregate(t=Coalesce(Sum('initial_balance'), Decimal('0.00')))['t']
+        global_credits = Expense.objects.aggregate(t=Coalesce(Sum('credited_amount'), Decimal('0.00')))['t']
+        global_debits = Expense.objects.aggregate(t=Coalesce(Sum('debited_amount'), Decimal('0.00')))['t']
+        total_balance = total_initial + global_credits - global_debits
 
     # Category breakdown (for pie chart)
     category_data = (
@@ -434,6 +450,10 @@ def export_expenses(request):
         qs = qs.filter(date__gte=date_from)
     if date_to:
         qs = qs.filter(date__lte=date_to)
+
+    mode = request.query_params.get('payment_mode')
+    if mode:
+        qs = qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
 
     # Note: avoid the name `format` — DRF reserves it for content negotiation.
     fmt = request.query_params.get('type', 'csv')
@@ -739,6 +759,42 @@ def payment_mode_balance_delete(request):
             {'detail': f'Payment mode "{mode}" not found.'},
             status=status.HTTP_404_NOT_FOUND,
         )
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, BlockPnlOnly])
+def payment_mode_balance_rename(request):
+    """Rename a payment mode EVERYWHERE — the PaymentModeBalance row and every
+    expense entry that used the old name (both credit and debit mode fields),
+    case-insensitively. If a mode with the new name already exists, the two are
+    merged (its balance row is kept). All-or-nothing in one transaction."""
+    from django.db import transaction
+    old = (request.data.get('old_name') or '').strip()
+    new = (request.data.get('new_name') or '').strip()
+    if not old or not new:
+        return Response({'detail': 'old_name and new_name are required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if old.lower() == new.lower():
+        return Response({'detail': 'The new name is the same as the old name.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        # Rewrite every expense that referenced the old mode name.
+        n_credit = Expense.objects.filter(credit_payment_mode__iexact=old).update(credit_payment_mode=new)
+        n_debit = Expense.objects.filter(debit_payment_mode__iexact=old).update(debit_payment_mode=new)
+
+        # Rename (or merge) the balance row.
+        old_obj = PaymentModeBalance.objects.filter(payment_mode__iexact=old).first()
+        new_obj = PaymentModeBalance.objects.filter(payment_mode__iexact=new).first()
+        if old_obj:
+            if new_obj and new_obj.pk != old_obj.pk:
+                old_obj.delete()  # merge into the existing "new" row
+            else:
+                old_obj.payment_mode = new
+                old_obj.save(update_fields=['payment_mode'])
+
+    return Response({
+        'detail': f'Renamed "{old}" → "{new}".',
+        'updated_entries': n_credit + n_debit,
+    }, status=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------

@@ -113,19 +113,12 @@ class Expense(models.Model):
     )
     credit_remark = models.CharField(max_length=300, blank=True, default='')
     credit_person = models.CharField(max_length=200, blank=True, default='')
+    # Free-form: payment modes are user-configurable (see PaymentModeBalance),
+    # so no fixed choices here. Kept as a denormalized string.
     credit_payment_mode = models.CharField(
         max_length=30,
         blank=True,
         default='',
-        choices=[
-            ('Cash', 'Cash'),
-            ('Bank Transfer', 'Bank Transfer'),
-            ('GPay', 'GPay'),
-            ('PhonePe', 'PhonePe'),
-            ('UPI', 'UPI'),
-            ('Cheque', 'Cheque'),
-            ('Other', 'Other'),
-        ],
     )
     debited_amount = models.DecimalField(
         max_digits=12,
@@ -140,15 +133,6 @@ class Expense(models.Model):
         max_length=30,
         blank=True,
         default='',
-        choices=[
-            ('Cash', 'Cash'),
-            ('Bank Transfer', 'Bank Transfer'),
-            ('GPay', 'GPay'),
-            ('PhonePe', 'PhonePe'),
-            ('UPI', 'UPI'),
-            ('Cheque', 'Cheque'),
-            ('Other', 'Other'),
-        ],
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -175,7 +159,6 @@ class PaymentModeBalance(models.Model):
     """Tracks initial balance for each payment mode."""
     payment_mode = models.CharField(
         max_length=30,
-        choices=PAYMENT_MODE_CHOICES,
         unique=True,
     )
     initial_balance = models.DecimalField(

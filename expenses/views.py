@@ -908,6 +908,12 @@ def profit_loss_view(request):
         else:
             qs = qs.filter(branch__location__icontains=branch_val)
 
+    # ---- Payment-mode filter (case-insensitive; matches either credit or debit side) ----
+    # Lets the P&L be scoped to a single mode, e.g. only "Bank of Baroda" entries.
+    mode_val = request.query_params.get('payment_mode')
+    if mode_val:
+        qs = qs.filter(Q(credit_payment_mode__iexact=mode_val) | Q(debit_payment_mode__iexact=mode_val))
+
     # ---- Determine the financial year window ----
     fy_param = request.query_params.get('fy')
     if fy_param and fy_param.isdigit():
@@ -1389,6 +1395,14 @@ def import_expenses(request):
         'transaction type': 'type',
     }
  
+    # Load user-configured payment modes so custom/renamed modes (e.g. "IDFC Bank",
+    # "Bank of Baroda") are preserved on import instead of collapsing to "Other".
+    configured_modes = {
+        m.strip().lower(): m
+        for m in PaymentModeBalance.objects.values_list('payment_mode', flat=True)
+        if m and m.strip()
+    }
+
     import_data = []
     # Start processing data rows occurring AFTER the header row
     for row_idx, row in enumerate(rows[header_idx + 1:], header_idx + 2):
@@ -1515,11 +1529,19 @@ def import_expenses(request):
                 row_dict['debit_payment_mode'] = row_dict['mode']
                 row_dict['credit_payment_mode'] = ''
 
-        # Normalize payment modes to valid Title Case/Uppercase choice values
+        # Normalize payment modes. Preference order:
+        #   1. Match a user-configured payment mode (case-insensitive) -> keep its stored casing
+        #   2. Map well-known aliases to a canonical label
+        #   3. Otherwise KEEP the original value (do NOT collapse to "Other")
         def normalize_mode(val):
             if not val:
                 return ''
-            val_lower = str(val).strip().lower()
+            raw = str(val).strip()
+            val_lower = raw.lower()
+            # 1. Preserve any mode the user has configured (e.g. "IDFC Bank", "Bank of Baroda")
+            if val_lower in configured_modes:
+                return configured_modes[val_lower]
+            # 2. Known aliases
             if val_lower in ['cash', 'c']:
                 return 'Cash'
             if val_lower in ['bank transfer', 'bank_transfer', 'bank', 'transfer']:
@@ -1532,7 +1554,8 @@ def import_expenses(request):
                 return 'UPI'
             if val_lower in ['cheque']:
                 return 'Cheque'
-            return 'Other'
+            # 3. Unknown but non-empty -> keep exactly what the sheet had
+            return raw
 
         if row_dict.get('credit_payment_mode'):
             row_dict['credit_payment_mode'] = normalize_mode(row_dict['credit_payment_mode'])

@@ -153,6 +153,27 @@ class BranchViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, RequireAnySection(SECTION_EXPENSES, SECTION_PETTYCASH)]
 
 
+# Sentinel value for the payment-mode filter that selects entries whose mode was
+# left blank (not entered) on the side that carries the amount.
+NO_PAYMENT_MODE = '__none__'
+
+
+def _blank_mode_q():
+    """Q matching expenses with no payment mode on their active (amount) side."""
+    return (
+        (Q(debited_amount__gt=0) & Q(debit_payment_mode='')) |
+        (Q(credited_amount__gt=0) & Q(credit_payment_mode=''))
+    )
+
+
+def _apply_mode_filter(qs, mode):
+    """Apply the payment-mode filter: NO_PAYMENT_MODE → blank-mode entries,
+    otherwise a case-insensitive match on either side."""
+    if mode == NO_PAYMENT_MODE:
+        return qs.filter(_blank_mode_q())
+    return qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
+
+
 class ExpenseViewSet(viewsets.ModelViewSet):
     """CRUD for expenses with filtering and running balance."""
 
@@ -188,10 +209,11 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         if date_to:
             qs = qs.filter(date__lte=date_to)
 
-        # Filter by payment mode (matches entries whose credit OR debit mode is it)
+        # Filter by payment mode (matches entries whose credit OR debit mode is it;
+        # the NO_PAYMENT_MODE sentinel selects blank-mode entries).
         mode = self.request.query_params.get('payment_mode')
         if mode:
-            qs = qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
+            qs = _apply_mode_filter(qs, mode)
 
         # Search
         search = self.request.query_params.get('search')
@@ -232,6 +254,27 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 
             expense.running_balances = balances.copy()
 
+        # Reconciliation vs the bank statements: flag each bank-mode expense as
+        # present ('in_statement') or missing ('not_in_statement') from its bank's
+        # statement. Non-bank modes (Cash, UPI, …) get None (no badge shown).
+        stmt_by_bank = {
+            b: _bank_statement_by_expense(b)
+            for b in (BankStatementEntry.BANK_IDFC, BankStatementEntry.BANK_BOB)
+        }
+        stmt_summary = {'in_statement': 0, 'not_in_statement': 0}
+        for expense in expenses:
+            mode = (expense.debit_payment_mode if (expense.debited_amount or Decimal('0.00')) > 0
+                    else expense.credit_payment_mode)
+            bank = _bank_for_mode(mode)
+            if bank:
+                stmt = stmt_by_bank[bank].get(expense.id)
+                expense.statement_status = 'in_statement' if stmt else 'not_in_statement'
+                expense.matched_statement = stmt
+                stmt_summary[expense.statement_status] += 1
+            else:
+                expense.statement_status = None
+                expense.matched_statement = None
+
         # To show newest first, reverse the list AFTER calculating running balances,
         # then paginate. This keeps correct balance cache on each object.
         expenses.reverse()
@@ -240,10 +283,14 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         page = self.paginate_queryset(expenses)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            resp = self.get_paginated_response(serializer.data)
+            # Reconciliation totals across the FULL filtered set (not just this page),
+            # so the Expenses section can show a "Matched with Statement" strip.
+            resp.data['statement_summary'] = stmt_summary
+            return resp
 
         serializer = self.get_serializer(expenses, many=True)
-        return Response(serializer.data)
+        return Response({'results': serializer.data, 'statement_summary': stmt_summary})
 
     @action(detail=False, methods=['delete'], url_path='delete-all')
     def delete_all(self, request):
@@ -323,14 +370,20 @@ def dashboard_view(request):
 
     mode = request.query_params.get('payment_mode')
     if mode:
-        qs = qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
+        qs = _apply_mode_filter(qs, mode)
 
     totals = qs.aggregate(
         total_credits=Coalesce(Sum('credited_amount'), Decimal('0.00')),
         total_debits=Coalesce(Sum('debited_amount'), Decimal('0.00')),
     )
 
-    if mode:
+    if mode == NO_PAYMENT_MODE:
+        # Blank-mode entries have no configured balance; report their net movement.
+        blank_qs = Expense.objects.filter(_blank_mode_q())
+        mode_credits = blank_qs.aggregate(t=Coalesce(Sum('credited_amount'), Decimal('0.00')))['t']
+        mode_debits = blank_qs.aggregate(t=Coalesce(Sum('debited_amount'), Decimal('0.00')))['t']
+        total_balance = mode_credits - mode_debits
+    elif mode:
         # Balance of the selected payment mode (all-time, cumulative).
         mode_initial = PaymentModeBalance.objects.filter(payment_mode__iexact=mode).aggregate(t=Coalesce(Sum('initial_balance'), Decimal('0.00')))['t']
         mode_credits = Expense.objects.filter(credit_payment_mode__iexact=mode).aggregate(t=Coalesce(Sum('credited_amount'), Decimal('0.00')))['t']
@@ -453,7 +506,7 @@ def export_expenses(request):
 
     mode = request.query_params.get('payment_mode')
     if mode:
-        qs = qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
+        qs = _apply_mode_filter(qs, mode)
 
     # Note: avoid the name `format` — DRF reserves it for content negotiation.
     fmt = request.query_params.get('type', 'csv')
@@ -2270,6 +2323,142 @@ def _import_bank_rows(rows, bank, source_file):
     return result
 
 
+# Which expense payment-mode names belong to each bank. Fuzzy (substring, case-
+# insensitive) so it survives the exact configured label — e.g. "IDFC Bank",
+# "IDFC FIRST", "Bank of Baroda", "BOB Current" all map correctly.
+_BANK_MODE_HINTS = {
+    BankStatementEntry.BANK_IDFC: ('idfc',),
+    BankStatementEntry.BANK_BOB: ('baroda', 'bob'),
+}
+
+
+def _bank_match_map(bank, entries):
+    """Reconcile bank-statement `entries` against the Expenses ledger.
+
+    A bank row counts as "matched" when the Expenses section holds an entry with
+    the SAME date, SAME amount, on the SAME side (a bank debit ↔ an expense
+    debit; a bank credit ↔ an expense credit) AND under a payment mode that
+    belongs to this bank. Matching is one-to-one: each expense can satisfy only
+    one bank row, so duplicate amounts on a day are reconciled by count.
+
+    Returns ``(match_map, suggested_mode)`` where match_map is a dict
+    ``{bank_entry_id: expense_detail}`` describing the matched Expenses entry (so
+    the UI can show "what did I record for this transaction?" when the status is
+    clicked), and suggested_mode is the payment-mode label the user most often
+    uses for this bank (so a missing row can pre-fill the Add-Expense form).
+    """
+    from collections import defaultdict, Counter
+
+    hints = _BANK_MODE_HINTS.get(bank, ())
+    if not hints:
+        return {}, ''
+
+    def belongs(mode):
+        m = (mode or '').lower()
+        return any(h in m for h in hints)
+
+    def q2(amount):
+        try:
+            return Decimal(amount).quantize(Decimal('0.01'))
+        except Exception:
+            return amount
+
+    # Pull only the expenses whose mode could belong to this bank.
+    mode_q = Q()
+    for h in hints:
+        mode_q |= Q(debit_payment_mode__icontains=h) | Q(credit_payment_mode__icontains=h)
+    exp = Expense.objects.filter(mode_q).values(
+        'id', 'date', 'category', 'branch__location',
+        'debited_amount', 'credited_amount',
+        'debit_payment_mode', 'credit_payment_mode',
+        'debit_remark', 'credit_remark', 'debit_person', 'credit_person',
+    )
+
+    # Available expense "slots" keyed by (date, amount, side). Each key holds a
+    # queue of the actual matching expense details, popped as bank rows claim them.
+    slots = defaultdict(list)
+    mode_counter = Counter()
+    for e in exp:
+        d = e['date']
+        if e['debited_amount'] and belongs(e['debit_payment_mode']):
+            mode_counter[e['debit_payment_mode']] += 1
+            slots[(d, q2(e['debited_amount']), 'debit')].append({
+                'id': e['id'], 'date': d.isoformat() if d else None,
+                'category': e['category'], 'branch': e['branch__location'],
+                'side': 'debit', 'amount': str(e['debited_amount']),
+                'mode': e['debit_payment_mode'], 'remark': e['debit_remark'],
+                'person': e['debit_person'],
+            })
+        if e['credited_amount'] and belongs(e['credit_payment_mode']):
+            mode_counter[e['credit_payment_mode']] += 1
+            slots[(d, q2(e['credited_amount']), 'credit')].append({
+                'id': e['id'], 'date': d.isoformat() if d else None,
+                'category': e['category'], 'branch': e['branch__location'],
+                'side': 'credit', 'amount': str(e['credited_amount']),
+                'mode': e['credit_payment_mode'], 'remark': e['credit_remark'],
+                'person': e['credit_person'],
+            })
+    suggested_mode = mode_counter.most_common(1)[0][0] if mode_counter else ''
+
+    # Claim slots in a stable order (oldest first) so the pairing is deterministic
+    # regardless of the display ordering.
+    match_map = {}
+    for be in sorted(entries, key=lambda x: (x.txn_date or datetime.min.date(), x.id)):
+        key = None
+        if be.debit and be.debit > 0:
+            key = (be.txn_date, q2(be.debit), 'debit')
+        elif be.credit and be.credit > 0:
+            key = (be.txn_date, q2(be.credit), 'credit')
+        if key and slots.get(key):
+            match_map[be.id] = slots[key].pop(0)
+    return match_map, suggested_mode
+
+
+def _bank_for_mode(mode):
+    """Which bank (if any) an expense payment-mode label belongs to, else None."""
+    m = (mode or '').lower()
+    for bank, hints in _BANK_MODE_HINTS.items():
+        if any(h in m for h in hints):
+            return bank
+    return None
+
+
+def _bank_matched_expense_id_set(bank):
+    """Set of Expense ids that reconcile to this bank's statement — the reverse
+    view of _bank_match_map, used to flag expenses as in/out of the statement."""
+    entries = list(BankStatementEntry.objects.filter(bank=bank))
+    match_map, _ = _bank_match_map(bank, entries)
+    return {d['id'] for d in match_map.values()}
+
+
+def _bank_statement_by_expense(bank):
+    """Reverse of _bank_match_map: returns ``{expense_id: statement_detail}`` so
+    the Expenses UI can show the bank-statement row an entry reconciled to when
+    its "In Statement" status is clicked."""
+    entries = list(BankStatementEntry.objects.filter(bank=bank))
+    by_id = {e.id: e for e in entries}
+    match_map, _ = _bank_match_map(bank, entries)
+    result = {}
+    for be_id, exp_detail in match_map.items():
+        be = by_id.get(be_id)
+        if not be:
+            continue
+        result[exp_detail['id']] = {
+            'id': be.id,
+            'bank': bank,
+            'bank_display': be.get_bank_display(),
+            'txn_date': be.txn_date.isoformat() if be.txn_date else None,
+            'value_date': be.value_date.isoformat() if be.value_date else None,
+            'narration': be.narration,
+            'ref_no': be.ref_no,
+            'debit': str(be.debit),
+            'credit': str(be.credit),
+            'balance': str(be.balance) if be.balance is not None else None,
+            'balance_dc': be.balance_dc,
+        }
+    return result
+
+
 class _BankStatementViewSet(viewsets.ModelViewSet):
     """Base viewset for a single bank's statement entries. Subclasses set
     `bank` and the section permission."""
@@ -2293,6 +2482,28 @@ class _BankStatementViewSet(viewsets.ModelViewSet):
         # at import, so -id reliably surfaces the latest transaction of each day
         # on top (and lets the UI read the current balance off the first row).
         return qs.order_by('-txn_date', '-id')
+
+    def list(self, request, *args, **kwargs):
+        """List entries, annotating each with `expense_status` — whether the row
+        has a matching entry in the Expenses ledger — and `matched_expense`, the
+        details of that entry (or null) so the UI can show it on demand."""
+        qs = self.filter_queryset(self.get_queryset())
+        entries = list(qs)
+        match_map, suggested_mode = _bank_match_map(self.bank, entries)
+        data = self.get_serializer(entries, many=True).data
+        for row in data:
+            m = match_map.get(row['id'])
+            row['expense_status'] = 'matched' if m else 'missing'
+            row['matched_expense'] = m
+        return Response({
+            'results': data,
+            'summary': {
+                'total': len(entries),
+                'matched': len(match_map),
+                'missing': len(entries) - len(match_map),
+                'suggested_mode': suggested_mode,
+            },
+        })
 
     @action(detail=False, methods=['post'], url_path='import')
     def import_statement(self, request):

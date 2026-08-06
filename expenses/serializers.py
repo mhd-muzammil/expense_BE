@@ -16,6 +16,11 @@ class BranchSerializer(serializers.ModelSerializer):
 class ExpenseSerializer(serializers.ModelSerializer):
     branch_location = serializers.CharField(source='branch.location', read_only=True)
     running_balances = serializers.JSONField(read_only=True, required=False)
+    # Reconciliation against the bank statements (set by ExpenseViewSet.list):
+    # 'in_statement' / 'not_in_statement' for bank-mode entries, else None.
+    statement_status = serializers.SerializerMethodField()
+    # The bank-statement row this entry reconciled to (null when not matched).
+    matched_statement = serializers.SerializerMethodField()
 
     class Meta:
         model = Expense
@@ -23,8 +28,14 @@ class ExpenseSerializer(serializers.ModelSerializer):
             'id', 'date', 'category', 'branch', 'branch_location',
             'credited_amount', 'credit_remark', 'credit_person', 'credit_payment_mode',
             'debited_amount', 'debit_remark', 'debit_person', 'debit_payment_mode',
-            'running_balances', 'created_at',
+            'running_balances', 'statement_status', 'matched_statement', 'created_at',
         ]
+
+    def get_statement_status(self, obj):
+        return getattr(obj, 'statement_status', None)
+
+    def get_matched_statement(self, obj):
+        return getattr(obj, 'matched_statement', None)
 
     def validate(self, data):
         """Ensure at least one of credit or debit is provided."""

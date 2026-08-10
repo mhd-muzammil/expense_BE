@@ -1,6 +1,6 @@
 from decimal import Decimal
 from rest_framework import serializers
-from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry, EngineerPnl
+from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry, EngineerPnl, SleekBillInvoice
 
 
 class BranchSerializer(serializers.ModelSerializer):
@@ -757,4 +757,22 @@ class EngineerPnlSerializer(serializers.ModelSerializer):
 
     def get_per_day(self, obj):
         return str(obj.per_day)
+
+
+class SleekBillInvoiceSerializer(serializers.ModelSerializer):
+    """One imported Sleek Bill invoice row (mirrors the Sleek Bill list)."""
+    has_pdf = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = SleekBillInvoice
+        fields = [
+            'id', 'invoice_number', 'invoice_type',
+            'client_name', 'client_gstin', 'client_phone', 'client_email',
+            'client_city', 'client_state', 'creator_name',
+            'issue_date', 'due_date', 'date_of_payment',
+            'currency', 'amount', 'tax', 'total', 'amount_paid', 'balance',
+            'status', 'dr_cr', 'cgst', 'sgst', 'igst',
+            'payment_mode', 'payment_info', 'financial_year',
+            'source_file', 'imported_at', 'has_pdf',
+        ]
 

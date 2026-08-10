@@ -16,10 +16,10 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 
 from .models import (
-    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL,
+    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, SleekBillInvoice, AppSetting,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE,
 )
-from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer
+from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer, SleekBillInvoiceSerializer
 
 
 # ---------------------------------------------------------------------------
@@ -2712,4 +2712,220 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             },
             'unmatched_engineers': unmatched,
         })
+
+
+# ---------------------------------------------------------------------------
+# Sleek Bill Invoice Register — import the Sleek Bill invoice export (.xls) and
+# mirror its list (Tax Invoice + Bill of Supply) in the Invoice Register section.
+# ---------------------------------------------------------------------------
+def _parse_sleekbill_date(cell):
+    import datetime as _dt
+    if cell is None or str(cell).strip() == '':
+        return None
+    if isinstance(cell, (_dt.datetime, _dt.date)):
+        return cell.date() if isinstance(cell, _dt.datetime) else cell
+    s = str(cell).strip().split(' ')[0]
+    for fmt in ('%d-%b-%Y', '%d-%B-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%d-%b-%y', '%d/%b/%Y'):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_sleekbill_amount(cell):
+    if cell is None:
+        return Decimal('0')
+    s = str(cell).strip().replace(',', '').replace('₹', '')
+    if s == '' or s in ('-', 'NA', 'N/A'):
+        return Decimal('0')
+    try:
+        return Decimal(s)
+    except Exception:
+        return Decimal('0')
+
+
+# Sleek Bill export column header (lowercased) -> model field.
+_SB_COLUMN_MAP = {
+    'client name': 'client_name', 'client gstin': 'client_gstin',
+    'invoice number': 'invoice_number', 'creator name': 'creator_name',
+    'client phone number': 'client_phone', 'client email': 'client_email',
+    'client city': 'client_city', 'client state': 'client_state',
+    'issue date': 'issue_date', 'due date': 'due_date', 'date of payment': 'date_of_payment',
+    'payment mode': 'payment_mode', 'financial year': 'financial_year', 'currency': 'currency',
+    'amount': 'amount', 'tax': 'tax', 'total': 'total',
+    'status': 'status', 'amount paid': 'amount_paid', 'balance': 'balance',
+    'dr. / cr.': 'dr_cr', 'type': 'invoice_type', 'payments': 'payment_info',
+    'cgst': 'cgst', 'sgst': 'sgst', 'igst': 'igst',
+}
+_SB_DATE_FIELDS = {'issue_date', 'due_date', 'date_of_payment'}
+_SB_AMOUNT_FIELDS = {'amount', 'tax', 'total', 'amount_paid', 'balance', 'cgst', 'sgst', 'igst'}
+
+
+def _import_sleekbill_rows(rows, source_file):
+    """Parse Sleek Bill export rows into SleekBillInvoice records (upsert by
+    invoice_number). Returns {created, updated, skipped, errors}."""
+    result = {'created': 0, 'updated': 0, 'skipped': 0, 'errors': []}
+    if not rows:
+        result['errors'].append('The file is empty.')
+        return result
+
+    # Locate the header row (must contain an "invoice number" column).
+    header_idx, col_map = None, {}
+    for i, row in enumerate(rows[:20]):
+        mapping = {}
+        for ci, cell in enumerate(row):
+            key = str(cell or '').strip().lower()
+            if key in _SB_COLUMN_MAP:
+                mapping[ci] = _SB_COLUMN_MAP[key]
+        if 'invoice_number' in mapping.values():
+            header_idx, col_map = i, mapping
+            break
+    if header_idx is None:
+        result['errors'].append('Could not find the invoice columns. Please upload the Sleek Bill "Invoices Export" file.')
+        return result
+
+    for row in rows[header_idx + 1:]:
+        if not any(c is not None and str(c).strip() != '' for c in row):
+            continue
+        data = {}
+        for ci, field in col_map.items():
+            if ci >= len(row):
+                continue
+            cell = row[ci]
+            if field in _SB_DATE_FIELDS:
+                data[field] = _parse_sleekbill_date(cell)
+            elif field in _SB_AMOUNT_FIELDS:
+                data[field] = _parse_sleekbill_amount(cell)
+            else:
+                data[field] = str(cell).strip() if cell is not None else ''
+        inv_no = data.pop('invoice_number', '').strip()
+        if not inv_no:
+            result['skipped'] += 1
+            continue
+        data['source_file'] = source_file[:255]
+        _, created = SleekBillInvoice.objects.update_or_create(invoice_number=inv_no, defaults=data)
+        result['created' if created else 'updated'] += 1
+    return result
+
+
+class SleekBillInvoiceViewSet(viewsets.ModelViewSet):
+    """Invoice Register — imported Sleek Bill invoices, mirroring the Sleek Bill
+    list. Supports import, type/status/search/date filters, and summary totals."""
+    serializer_class = SleekBillInvoiceSerializer
+    pagination_class = ExpensePagination
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_SBINVOICE)]
+
+    def get_queryset(self):
+        qs = SleekBillInvoice.objects.all()
+        inv_type = self.request.query_params.get('type')
+        if inv_type:
+            qs = qs.filter(invoice_type__iexact=inv_type)
+        status_val = self.request.query_params.get('status')
+        if status_val:
+            qs = qs.filter(status__iexact=status_val)
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(Q(invoice_number__icontains=search) | Q(client_name__icontains=search) | Q(client_gstin__icontains=search))
+        date_from = self.request.query_params.get('from')
+        date_to = self.request.query_params.get('to')
+        if date_from:
+            qs = qs.filter(issue_date__gte=date_from)
+        if date_to:
+            qs = qs.filter(issue_date__lte=date_to)
+        return qs.order_by('-issue_date', '-id')
+
+    def list(self, request, *args, **kwargs):
+        qs = self.filter_queryset(self.get_queryset())
+        agg = qs.aggregate(
+            amount=Coalesce(Sum('amount'), Decimal('0.00')),
+            tax=Coalesce(Sum('tax'), Decimal('0.00')),
+            total=Coalesce(Sum('total'), Decimal('0.00')),
+            paid=Coalesce(Sum('amount_paid'), Decimal('0.00')),
+            balance=Coalesce(Sum('balance'), Decimal('0.00')),
+        )
+        summary = {
+            'count': qs.count(),
+            'tax_invoice': qs.filter(invoice_type__iexact=SleekBillInvoice.TYPE_TAX).count(),
+            'bill_of_supply': qs.filter(invoice_type__iexact=SleekBillInvoice.TYPE_BOS).count(),
+            'amount': str(agg['amount']), 'tax': str(agg['tax']), 'total': str(agg['total']),
+            'paid': str(agg['paid']), 'balance': str(agg['balance']),
+        }
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            resp = self.get_paginated_response(self.get_serializer(page, many=True).data)
+            resp.data['summary'] = summary
+            return resp
+        return Response({'results': self.get_serializer(qs, many=True).data, 'summary': summary})
+
+    @action(detail=False, methods=['post'], url_path='import')
+    def import_invoices(self, request):
+        file_obj = request.FILES.get('file')
+        if not file_obj:
+            return Response({'detail': 'No file was uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            rows = _read_tabular(file_obj)
+        except ValueError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        res = _import_sleekbill_rows(rows, file_obj.name)
+        if res['created'] == 0 and res['updated'] == 0 and res['errors']:
+            return Response({'detail': res['errors'][0], **res}, status=status.HTTP_400_BAD_REQUEST)
+        parts = []
+        if res['created']:
+            parts.append(f"added {res['created']}")
+        if res['updated']:
+            parts.append(f"updated {res['updated']}")
+        res['detail'] = 'Imported ' + (', '.join(parts) if parts else '0') + ' invoice(s).'
+        return Response(res, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['delete'], url_path='clear')
+    def clear(self, request):
+        n, _ = SleekBillInvoice.objects.all().delete()
+        return Response({'detail': f'Cleared {n} invoices.', 'deleted': n})
+
+    @action(detail=True, methods=['get'], url_path='pdf')
+    def pdf(self, request, pk=None):
+        """Serve the attached Sleek Bill invoice PDF (fetched with auth by the UI)."""
+        obj = self.get_object()
+        if not obj.has_pdf:
+            return Response({'detail': 'No PDF attached to this invoice.'}, status=status.HTTP_404_NOT_FOUND)
+        resp = HttpResponse(bytes(obj.pdf_data), content_type='application/pdf')
+        resp['Content-Disposition'] = f'inline; filename="{obj.invoice_number}.pdf"'
+        return resp
+
+    @action(detail=True, methods=['post'], url_path='upload-pdf')
+    def upload_pdf(self, request, pk=None):
+        """Attach a PDF to THIS specific invoice (reliable — no matching needed)."""
+        obj = self.get_object()
+        f = request.FILES.get('file')
+        if not f:
+            return Response({'detail': 'No file was uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+        obj.pdf_data = f.read()
+        obj.pdf_name = f.name[:255]
+        obj.save(update_fields=['pdf_data', 'pdf_name'])
+        return Response({'detail': f'PDF attached to {obj.invoice_number}.'})
+
+    @action(detail=False, methods=['post'], url_path='upload-pdfs')
+    def upload_pdfs(self, request):
+        """Bulk-attach PDFs, matching each file to an invoice by the invoice
+        number found in its filename (e.g. 'RT26-27-SER-15.pdf')."""
+        import re
+        files = request.FILES.getlist('files') or request.FILES.getlist('file')
+        if not files:
+            return Response({'detail': 'No files were uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+        matched, unmatched = 0, []
+        for f in files:
+            m = re.search(r'RT\d{2}-\d{2}-(?:SER|REN)-\d+', f.name, re.IGNORECASE)
+            inv = SleekBillInvoice.objects.filter(invoice_number__iexact=m.group(0)).first() if m else None
+            if inv:
+                inv.pdf_data = f.read()
+                inv.pdf_name = f.name[:255]
+                inv.save(update_fields=['pdf_data', 'pdf_name'])
+                matched += 1
+            else:
+                unmatched.append(f.name)
+        parts = [f'Attached {matched} PDF(s)']
+        if unmatched:
+            parts.append(f'{len(unmatched)} could not be matched by invoice number')
+        return Response({'detail': ', '.join(parts) + '.', 'matched': matched, 'unmatched': unmatched})
 

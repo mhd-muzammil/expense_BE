@@ -24,8 +24,9 @@ SECTION_TAXINVOICE = 'taxinvoice'
 SECTION_IDFC = 'idfc'
 SECTION_BOB = 'bob'
 SECTION_ENGPNL = 'engpnl'
+SECTION_SBINVOICE = 'sbinvoice'
 
-ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL]
+ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE]
 
 SECTION_LABELS = {
     SECTION_DASHBOARD: 'Dashboard',
@@ -44,6 +45,7 @@ SECTION_LABELS = {
     SECTION_IDFC: 'IDFC Statement',
     SECTION_BOB: 'BOB Statement',
     SECTION_ENGPNL: 'Engineer P&L',
+    SECTION_SBINVOICE: 'Invoice Register',
 }
 
 # Our own company's GST state code (Tamil Nadu). A supply to a different state
@@ -1135,5 +1137,64 @@ class EngineerPnl(models.Model):
             'profit_loss': str(profit_loss),
             'nett': str(profit_loss),                    # alias (Profit/Loss)
         }
+
+
+class SleekBillInvoice(models.Model):
+    """A single invoice imported from the Sleek Bill export (.xls). Mirrors the
+    Sleek Bill invoice list so the Invoice Register section shows the same data.
+    One row per invoice; re-importing updates existing rows by invoice_number."""
+    TYPE_TAX = 'Tax Invoice'
+    TYPE_BOS = 'Bill of Supply'
+
+    invoice_number = models.CharField(max_length=80, unique=True, db_index=True)
+    invoice_type = models.CharField(max_length=40, blank=True, default='', db_index=True)
+
+    client_name = models.CharField(max_length=250, blank=True, default='')
+    client_gstin = models.CharField(max_length=20, blank=True, default='')
+    client_phone = models.CharField(max_length=40, blank=True, default='')
+    client_email = models.CharField(max_length=150, blank=True, default='')
+    client_city = models.CharField(max_length=100, blank=True, default='')
+    client_state = models.CharField(max_length=100, blank=True, default='')
+    creator_name = models.CharField(max_length=150, blank=True, default='')
+
+    issue_date = models.DateField(null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True)
+    date_of_payment = models.DateField(null=True, blank=True)
+
+    currency = models.CharField(max_length=10, blank=True, default='INR')
+    amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)   # taxable value
+    tax = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    total = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    amount_paid = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    balance = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+
+    status = models.CharField(max_length=30, blank=True, default='', db_index=True)
+    dr_cr = models.CharField(max_length=5, blank=True, default='')
+
+    cgst = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    sgst = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    igst = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+
+    payment_mode = models.CharField(max_length=60, blank=True, default='')
+    payment_info = models.TextField(blank=True, default='')
+    financial_year = models.CharField(max_length=20, blank=True, default='')
+
+    source_file = models.CharField(max_length=255, blank=True, default='')
+    imported_at = models.DateTimeField(auto_now=True)
+
+    # The exact Sleek Bill invoice PDF, stored in the DB (no media volume needed).
+    pdf_data = models.BinaryField(null=True, blank=True, editable=False)
+    pdf_name = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        ordering = ['-issue_date', '-id']
+        verbose_name_plural = 'Sleek Bill invoices'
+
+    def __str__(self):
+        return f"{self.invoice_number} | {self.client_name}"
+
+    @property
+    def has_pdf(self):
+        return self.pdf_data is not None and len(self.pdf_data) > 0
 
 

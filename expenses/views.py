@@ -16,10 +16,10 @@ from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 
 from .models import (
-    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, SleekBillInvoice, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE,
+    Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, SleekBillInvoice, Subscription, AppSetting,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION,
 )
-from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer, SleekBillInvoiceSerializer
+from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer, SleekBillInvoiceSerializer, SubscriptionSerializer
 
 
 # ---------------------------------------------------------------------------
@@ -2928,4 +2928,18 @@ class SleekBillInvoiceViewSet(viewsets.ModelViewSet):
         if unmatched:
             parts.append(f'{len(unmatched)} could not be matched by invoice number')
         return Response({'detail': ', '.join(parts) + '.', 'matched': matched, 'unmatched': unmatched})
+
+
+class SubscriptionViewSet(viewsets.ModelViewSet):
+    """CRUD for tracked service subscriptions (with renewal dates + reminders).
+    Ordered by renewal date so the soonest-expiring appear first."""
+    serializer_class = SubscriptionSerializer
+    pagination_class = None
+    permission_classes = [IsAuthenticated, RequireSection(SECTION_SUBSCRIPTION)]
+
+    def get_queryset(self):
+        qs = Subscription.objects.all()
+        if self.request.query_params.get('active') == '1':
+            qs = qs.filter(active=True)
+        return qs.order_by('renewal_date', 'id')
 

@@ -18,6 +18,7 @@ router.register(r'idfc-statements', views.IDFCStatementViewSet, basename='idfc-s
 router.register(r'bob-statements', views.BOBStatementViewSet, basename='bob-statement')
 router.register(r'engineer-pnl', views.EngineerPnlViewSet, basename='engineer-pnl')
 router.register(r'sleekbill-invoices', views.SleekBillInvoiceViewSet, basename='sleekbill-invoice')
+router.register(r'subscriptions', views.SubscriptionViewSet, basename='subscription')
 
 urlpatterns = [
     path('', include(router.urls)),

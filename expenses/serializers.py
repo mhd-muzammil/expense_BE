@@ -1,6 +1,6 @@
 from decimal import Decimal
 from rest_framework import serializers
-from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry, EngineerPnl, SleekBillInvoice
+from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry, EngineerPnl, SleekBillInvoice, Subscription
 
 
 class BranchSerializer(serializers.ModelSerializer):
@@ -775,4 +775,25 @@ class SleekBillInvoiceSerializer(serializers.ModelSerializer):
             'payment_mode', 'payment_info', 'financial_year',
             'source_file', 'imported_at', 'has_pdf',
         ]
+
+
+class SubscriptionSerializer(serializers.ModelSerializer):
+    """A tracked service subscription with computed days-left and status."""
+    days_left = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Subscription
+        fields = [
+            'id', 'name', 'vendor', 'amount', 'cycle', 'renewal_date',
+            'reminder_days_before', 'auto_renew', 'notes', 'active',
+            'days_left', 'status', 'created_at',
+        ]
+        read_only_fields = ['created_at']
+
+    def get_days_left(self, obj):
+        return obj.days_left
+
+    def get_status(self, obj):
+        return obj.status
 

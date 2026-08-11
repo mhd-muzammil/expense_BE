@@ -25,8 +25,9 @@ SECTION_IDFC = 'idfc'
 SECTION_BOB = 'bob'
 SECTION_ENGPNL = 'engpnl'
 SECTION_SBINVOICE = 'sbinvoice'
+SECTION_SUBSCRIPTION = 'subscription'
 
-ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE]
+ALL_SECTIONS = [SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION]
 
 SECTION_LABELS = {
     SECTION_DASHBOARD: 'Dashboard',
@@ -46,6 +47,7 @@ SECTION_LABELS = {
     SECTION_BOB: 'BOB Statement',
     SECTION_ENGPNL: 'Engineer P&L',
     SECTION_SBINVOICE: 'Invoice Register',
+    SECTION_SUBSCRIPTION: 'Subscriptions',
 }
 
 # Our own company's GST state code (Tamil Nadu). A supply to a different state
@@ -1196,5 +1198,49 @@ class SleekBillInvoice(models.Model):
     @property
     def has_pdf(self):
         return self.pdf_data is not None and len(self.pdf_data) > 0
+
+
+class Subscription(models.Model):
+    """A recurring service subscription (Sleek Bill, hosting, domain, etc.) with
+    a renewal date, so the app can flag ones expiring soon / expired and the
+    user never misses a renewal."""
+    CYCLE_CHOICES = [
+        ('monthly', 'Monthly'), ('quarterly', 'Quarterly'),
+        ('half_yearly', 'Half Yearly'), ('yearly', 'Yearly'), ('one_time', 'One Time'),
+    ]
+
+    name = models.CharField(max_length=200)
+    vendor = models.CharField(max_length=200, blank=True, default='')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    cycle = models.CharField(max_length=20, choices=CYCLE_CHOICES, default='yearly')
+    renewal_date = models.DateField(help_text='Next renewal / expiry date')
+    reminder_days_before = models.PositiveIntegerField(default=7)
+    auto_renew = models.BooleanField(default=False)
+    notes = models.TextField(blank=True, default='')
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['renewal_date', 'id']
+
+    def __str__(self):
+        return f"{self.name} — {self.renewal_date}"
+
+    @property
+    def days_left(self):
+        from datetime import date
+        return (self.renewal_date - date.today()).days if self.renewal_date else None
+
+    @property
+    def status(self):
+        d = self.days_left
+        if d is None:
+            return 'active'
+        if d < 0:
+            return 'expired'
+        if d <= self.reminder_days_before:
+            return 'expiring_soon'
+        return 'active'
 
 

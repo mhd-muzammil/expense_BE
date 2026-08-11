@@ -879,6 +879,31 @@ def categories_view(request):
 # the P&L. Compared case-insensitively after trimming.
 _PNL_EXCLUDED_BRANCHES = {'', 'null', 'none', 'common', 'all location', 'all locations', 'main branch'}
 
+# Expense category (canonical UPPER) -> parent group, so the P&L can show
+# collapsible expense groups with per-group subtotals. Unmapped categories fall
+# into 'Office & Others'.
+_PNL_EXPENSE_GROUPS = {
+    'SALARY': 'Salary & Wages', 'SALARY MONTHLY': 'Salary & Wages', 'SALARY ADVANCE': 'Salary & Wages',
+    'SALARY SETTLEMENT': 'Salary & Wages', 'FF SETTLEMENT': 'Salary & Wages',
+    'OFFICE RENT': 'Rent & Facilities', 'RENT': 'Rent & Facilities', 'ROOM RENT': 'Rent & Facilities', 'HOUSE KEEPING': 'Rent & Facilities',
+    'EB BILL': 'Utilities & Recharge', 'WIFI RECHARGE': 'Utilities & Recharge', 'PHONE RECHARGE': 'Utilities & Recharge',
+    'PETROL ALLOWANCE': 'Travel & Fuel', 'PETROL ADVANCE': 'Travel & Fuel', 'TRAVEL': 'Travel & Fuel',
+    'TRAVEL EXPENSE': 'Travel & Fuel', 'TRAVEL EXPENSES': 'Travel & Fuel', 'CAB': 'Travel & Fuel', 'RAPIDO': 'Travel & Fuel', 'TRANSPORT': 'Travel & Fuel',
+    'GST': 'Statutory & Fees', 'GST FEE': 'Statutory & Fees', 'AUDITOR FEES': 'Statutory & Fees',
+    'LOAN RETURN': 'Loans & EMI', 'LAON': 'Loans & EMI', 'EMI': 'Loans & EMI', 'LAPTOP EMI': 'Loans & EMI',
+    'ASSET': 'Purchases & Assets', 'ASST PURCHASE': 'Purchases & Assets', 'PURCHASE': 'Purchases & Assets',
+    'TOOL PURCHASE': 'Purchases & Assets', 'SOFTWARE PURCHASE': 'Purchases & Assets', 'SERVER PURCHASE': 'Purchases & Assets',
+    'LYSTLOC': 'Subscriptions & Licenses', 'GPS LICENSE': 'Subscriptions & Licenses', 'FB LEAD': 'Subscriptions & Licenses',
+    'COURIER': 'Office & Others', 'PETTY CASH': 'Office & Others', 'STATIONERY EXPENSES': 'Office & Others', 'STATIONARY': 'Office & Others',
+    'VENDOR PAYMENT': 'Office & Others', 'REFUND': 'Office & Others', 'OTHER EXPENSE': 'Office & Others', 'OTHER EXPENSES': 'Office & Others', 'EXPENSES': 'Office & Others',
+}
+_PNL_DEFAULT_EXPENSE_GROUP = 'Office & Others'
+# Display order of the groups (unlisted groups sort after these, alphabetically).
+_PNL_GROUP_ORDER = [
+    'Salary & Wages', 'Rent & Facilities', 'Utilities & Recharge', 'Travel & Fuel',
+    'Statutory & Fees', 'Loans & EMI', 'Purchases & Assets', 'Subscriptions & Licenses', 'Office & Others',
+]
+
 # Categories that are always income even if a stray debit exists on them. These
 # are the credit-driven revenue streams seen in the ledger. Matched on the
 # canonical (UPPER + trimmed) category name.
@@ -1031,7 +1056,10 @@ def profit_loss_view(request):
             total = sum(monthly.values(), Decimal('0.00'))
             if total == 0:
                 continue
-            expense_rows.append({'category': entry['display'], 'monthly': monthly, 'total': total})
+            expense_rows.append({
+                'category': entry['display'], 'monthly': monthly, 'total': total,
+                'group': _PNL_EXPENSE_GROUPS.get(canon, _PNL_DEFAULT_EXPENSE_GROUP),
+            })
 
     # Sort each section by grand total, largest first (most material rows on top).
     income_rows.sort(key=lambda x: x['total'], reverse=True)
@@ -1043,6 +1071,7 @@ def profit_loss_view(request):
                 'category': row['category'],
                 'monthly': {mk: str(row['monthly'][mk]) for mk in month_keys},
                 'total': str(row['total']),
+                **({'group': row['group']} if 'group' in row else {}),
             }
             for row in section
         ]
@@ -1084,6 +1113,7 @@ def profit_loss_view(request):
         'branches': branches,
         'income': _serialize_rows(income_rows),
         'expense': _serialize_rows(expense_rows),
+        'expense_group_order': _PNL_GROUP_ORDER,
         'income_by_month': {mk: str(income_by_month[mk]) for mk in month_keys},
         'expense_by_month': {mk: str(expense_by_month[mk]) for mk in month_keys},
         'net_by_month': {mk: str(net_by_month[mk]) for mk in month_keys},

@@ -29,6 +29,7 @@ urlpatterns = [
     path('import/', views.import_expenses, name='import'),
     path('categories/', views.categories_view, name='categories'),
     path('profit-loss/', views.profit_loss_view, name='profit-loss'),
+    path('insights/', views.insights_view, name='insights'),
     path('payment-mode-balances/', views.payment_mode_balances_view, name='payment-mode-balances'),
     path('payment-mode-balances/set/', views.payment_mode_balance_set, name='payment-mode-balance-set'),
     path('payment-mode-balances/delete/', views.payment_mode_balance_delete, name='payment-mode-balance-delete'),

@@ -17,7 +17,7 @@ from rest_framework.pagination import PageNumberPagination
 
 from .models import (
     Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, SleekBillInvoice, Subscription, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION, SECTION_INSIGHTS,
 )
 from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer, SleekBillInvoiceSerializer, SubscriptionSerializer
 
@@ -1120,6 +1120,388 @@ def profit_loss_view(request):
         'total_income': str(total_income),
         'total_expense': str(total_expense),
         'net_profit': str(total_income - total_expense),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Business Insights — deterministic (no AI/LLM) analytics over the ledger:
+# branch ranking, expense trends, a simple forecast, spike detection and
+# rule-based recommendations. Reuses the P&L canonicalisation/classification.
+# ---------------------------------------------------------------------------
+
+def _insights_month_window(n):
+    """The last `n` month keys ('YYYY-MM') ending at the most recent expense
+    month (or the current month if there is no data), oldest first."""
+    latest = Expense.objects.order_by('-date').values_list('date', flat=True).first()
+    ref = latest if latest else datetime.now().date()
+    y, m = ref.year, ref.month
+    keys = []
+    for _ in range(n):
+        keys.append(f'{y:04d}-{m:02d}')
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    keys.reverse()
+    return keys
+
+
+def _next_month_key(mk):
+    y, m = int(mk[:4]), int(mk[5:])
+    m += 1
+    if m == 13:
+        m, y = 1, y + 1
+    return f'{y:04d}-{m:02d}'
+
+
+def _month_label(mk):
+    names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    y, m = mk[:4], int(mk[5:])
+    return f'{names[m - 1]} {y[2:]}' if 1 <= m <= 12 else mk
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireSection(SECTION_INSIGHTS)])
+def insights_view(request):
+    """AI-free business analytics.
+
+    Query params (all optional):
+      months     – size of the trailing window in months (3-24, default 12).
+      date_from  – 'YYYY-MM-DD'; with date_to, overrides the trailing window.
+      date_to    – 'YYYY-MM-DD'.
+      branch     – branch id, or a case-insensitive location substring.
+    """
+    from calendar import monthrange
+
+    def _parse_date(value):
+        try:
+            return datetime.strptime(value, '%Y-%m-%d').date()
+        except (TypeError, ValueError):
+            return None
+
+    date_from = _parse_date(request.query_params.get('date_from'))
+    date_to = _parse_date(request.query_params.get('date_to'))
+
+    if date_from and date_to and date_from <= date_to:
+        # Explicit range: bucket by month across the whole span.
+        start, end = date_from, date_to
+        month_keys, y, m = [], start.year, start.month
+        while (y, m) <= (end.year, end.month):
+            month_keys.append(f'{y:04d}-{m:02d}')
+            m += 1
+            if m == 13:
+                m, y = 1, y + 1
+        n = len(month_keys)
+    else:
+        try:
+            n = max(3, min(24, int(request.query_params.get('months', 12))))
+        except (TypeError, ValueError):
+            n = 12
+        month_keys = _insights_month_window(n)
+        start = datetime.strptime(month_keys[0] + '-01', '%Y-%m-%d').date()
+        ey, em = int(month_keys[-1][:4]), int(month_keys[-1][5:])
+        end = datetime(ey, em, monthrange(ey, em)[1]).date()
+
+    qs = Expense.objects.filter(date__gte=start, date__lte=end)
+
+    # ---- Branch filter (case-insensitive; digits => exact id) ----
+    branch_val = request.query_params.get('branch')
+    if branch_val:
+        if branch_val.isdigit():
+            qs = qs.filter(branch_id=branch_val)
+        else:
+            qs = qs.filter(branch__location__icontains=branch_val)
+
+    ZERO = Decimal('0.00')
+
+    # ---- category × month aggregation → classify + monthly trend ----
+    cm = (
+        qs.annotate(month=TruncMonth('date'))
+        .values('category', 'month')
+        .annotate(credit=Coalesce(Sum('credited_amount'), ZERO), debit=Coalesce(Sum('debited_amount'), ZERO))
+    )
+    cats = {}  # canon -> {display, credit_total, debit_total, months:{mk:{credit,debit}}, group}
+    for r in cm:
+        canon = _pnl_canonical(r['category']) or 'UNCATEGORISED'
+        e = cats.get(canon)
+        if e is None:
+            e = {'display': canon.title(), 'credit_total': ZERO, 'debit_total': ZERO, 'months': {}}
+            cats[canon] = e
+        e['credit_total'] += r['credit']
+        e['debit_total'] += r['debit']
+        mk = r['month'].strftime('%Y-%m') if r['month'] else ''
+        slot = e['months'].setdefault(mk, {'credit': ZERO, 'debit': ZERO})
+        slot['credit'] += r['credit']
+        slot['debit'] += r['debit']
+
+    cat_kind = {c: _pnl_classify(c, e['credit_total'], e['debit_total']) for c, e in cats.items()}
+
+    inc_by_month = {mk: ZERO for mk in month_keys}
+    exp_by_month = {mk: ZERO for mk in month_keys}
+    expense_cats = []  # {canon, category, total, monthly, group}
+    for canon, e in cats.items():
+        if cat_kind[canon] == 'income':
+            for mk in month_keys:
+                inc_by_month[mk] += e['months'].get(mk, {}).get('credit', ZERO)
+        else:
+            monthly = {mk: e['months'].get(mk, {}).get('debit', ZERO) for mk in month_keys}
+            for mk in month_keys:
+                exp_by_month[mk] += monthly[mk]
+            total = sum(monthly.values(), ZERO)
+            if total > 0:
+                expense_cats.append({
+                    'canon': canon, 'category': e['display'], 'total': total, 'monthly': monthly,
+                    'group': _PNL_EXPENSE_GROUPS.get(canon, _PNL_DEFAULT_EXPENSE_GROUP),
+                })
+    net_by_month = {mk: inc_by_month[mk] - exp_by_month[mk] for mk in month_keys}
+
+    total_income = sum(inc_by_month.values(), ZERO)
+    total_expense = sum(exp_by_month.values(), ZERO)
+    net_profit = total_income - total_expense
+
+    # ---- month-by-month table: each month's result, its biggest expense head,
+    # and how the profit moved vs the month before ----
+    monthly_breakdown = []
+    prev_net = None
+    for mk in month_keys:
+        inc, exp = inc_by_month[mk], exp_by_month[mk]
+        net = net_by_month[mk]
+        top_cat, top_amt = None, ZERO
+        for c in expense_cats:
+            amt = c['monthly'].get(mk, ZERO)
+            if amt > top_amt:
+                top_cat, top_amt = c['category'], amt
+        # Margin: what fraction of income was kept as profit.
+        margin = round(float(net / inc * 100), 1) if inc > 0 else None
+        change = None
+        if prev_net is not None:
+            change = str((net - prev_net).quantize(Decimal('0.01')))
+        monthly_breakdown.append({
+            'month': mk,
+            'income': str(inc),
+            'expense': str(exp),
+            'net': str(net),
+            'is_profit': net >= 0,
+            'margin_pct': margin,
+            'change_vs_prev': change,
+            'top_expense': top_cat,
+            'top_expense_amount': str(top_amt) if top_cat else None,
+            'has_data': (inc > 0 or exp > 0),
+        })
+        prev_net = net
+
+    # Best and worst months (only among months that actually have entries).
+    active_months = [m for m in monthly_breakdown if m['has_data']]
+    best_month = max(active_months, key=lambda m: Decimal(m['net']), default=None)
+    worst_month = min(active_months, key=lambda m: Decimal(m['net']), default=None)
+    profit_months = sum(1 for m in active_months if m['is_profit'])
+    loss_months = len(active_months) - profit_months
+
+    # ---- branch ranking (income vs expense per canonical branch) ----
+    br = (
+        qs.values('branch__location', 'category')
+        .annotate(credit=Coalesce(Sum('credited_amount'), ZERO), debit=Coalesce(Sum('debited_amount'), ZERO))
+    )
+    branches = {}  # canon -> {display, income, expense}
+    for r in br:
+        cb = _pnl_canonical(r['branch__location'])
+        if not cb or cb.lower() in _PNL_EXCLUDED_BRANCHES:
+            continue
+        b = branches.get(cb)
+        if b is None:
+            b = {'display': cb.title(), 'income': ZERO, 'expense': ZERO}
+            branches[cb] = b
+        canon_cat = _pnl_canonical(r['category']) or 'UNCATEGORISED'
+        kind = cat_kind.get(canon_cat) or _pnl_classify(canon_cat, r['credit'], r['debit'])
+        if kind == 'income':
+            b['income'] += r['credit']
+        else:
+            b['expense'] += r['debit']
+    branch_ranking = sorted(
+        ({'branch': b['display'], 'income': b['income'], 'expense': b['expense'], 'net': b['income'] - b['expense']}
+         for b in branches.values()),
+        key=lambda x: x['net'], reverse=True,
+    )
+
+    # ---- forecast next month: average of the last 3 months ----
+    tail = month_keys[-3:]
+    fc_income = sum((inc_by_month[mk] for mk in tail), ZERO) / len(tail)
+    fc_expense = sum((exp_by_month[mk] for mk in tail), ZERO) / len(tail)
+    forecast = {
+        'month': _next_month_key(month_keys[-1]),
+        'income': fc_income.quantize(Decimal('0.01')),
+        'expense': fc_expense.quantize(Decimal('0.01')),
+        'net': (fc_income - fc_expense).quantize(Decimal('0.01')),
+    }
+
+    # ---- per-category recent growth (last 3 vs previous 3 months) ----
+    def growth_pct(monthly):
+        if len(month_keys) < 6:
+            return None
+        last3 = sum((monthly[mk] for mk in month_keys[-3:]), ZERO)
+        prev3 = sum((monthly[mk] for mk in month_keys[-6:-3]), ZERO)
+        if prev3 <= 0:
+            return None
+        return round(float((last3 - prev3) / prev3 * 100), 1)
+
+    expense_cats.sort(key=lambda c: c['total'], reverse=True)
+    top_expenses = [{
+        'category': c['category'],
+        'total': str(c['total']),
+        'share': round(float(c['total'] / total_expense), 4) if total_expense > 0 else 0,
+        'growth_pct': growth_pct(c['monthly']),
+        'group': c['group'],
+    } for c in expense_cats[:8]]
+
+    # ---- anomalies: latest month >> its own prior-months average ----
+    anomalies = []
+    latest_mk = month_keys[-1]
+    for c in expense_cats:
+        prior = [c['monthly'][mk] for mk in month_keys[:-1]]
+        nonzero = [v for v in prior if v > 0]
+        if not nonzero:
+            continue
+        avg = sum(nonzero, ZERO) / len(nonzero)
+        cur = c['monthly'][latest_mk]
+        if avg > 0 and cur >= avg * Decimal('2') and cur >= Decimal('5000'):
+            anomalies.append({
+                'category': c['category'], 'month': latest_mk,
+                'amount': str(cur), 'avg': str(avg.quantize(Decimal('0.01'))),
+                'times': round(float(cur / avg), 1),
+            })
+    anomalies.sort(key=lambda a: float(a['amount']), reverse=True)
+
+    # ---- rule-based recommendations / action points ----
+    recs = []
+
+    def money(v):
+        return f'₹{float(v):,.0f}'
+
+    # Headline: profit/loss stated with the margin, i.e. what is kept per ₹100 earned.
+    if total_income > 0 or total_expense > 0:
+        if net_profit >= 0:
+            kept = f' You keep about {money(net_profit / total_income * 100)} out of every ₹100 you earn.' if total_income > 0 else ''
+            recs.append({'kind': 'good', 'title': 'You are in profit',
+                         'text': f'Across {len(active_months) or len(month_keys)} months you earned {money(total_income)} '
+                                 f'and spent {money(total_expense)}, leaving a profit of {money(net_profit)}.{kept}'})
+        else:
+            overspend = f' For every ₹100 earned you are spending about {money(total_expense / total_income * 100)}.' if total_income > 0 else ''
+            recs.append({'kind': 'alert', 'title': 'You are running at a loss',
+                         'text': f'Across {len(active_months) or len(month_keys)} months you earned {money(total_income)} '
+                                 f'but spent {money(total_expense)} — short by {money(-net_profit)}.{overspend} '
+                                 f'The biggest expense heads below are where to look first.'})
+
+    # How consistent is the result month to month?
+    if len(active_months) >= 3:
+        if loss_months == 0:
+            recs.append({'kind': 'good', 'title': 'Every month was profitable',
+                         'text': f'All {len(active_months)} months with entries ended in profit. '
+                                 f'That is a steady business — keep the current cost pattern.'})
+        elif profit_months == 0:
+            recs.append({'kind': 'alert', 'title': 'No month was profitable',
+                         'text': f'All {len(active_months)} months ended in loss. This is not a one-off month — '
+                                 f'the cost structure itself needs review, not just one expense.'})
+        else:
+            recs.append({'kind': 'tip', 'title': f'{profit_months} profit months, {loss_months} loss months',
+                         'text': f'Out of {len(active_months)} months, {profit_months} made money and {loss_months} lost money. '
+                                 f'Compare a profit month against a loss month in the table below to see what changed.'})
+
+    # Point at the best and worst months by name so they can be examined directly.
+    if best_month and worst_month and best_month['month'] != worst_month['month']:
+        recs.append({'kind': 'good', 'title': f'Best month: {_month_label(best_month["month"])}',
+                     'text': f'{_month_label(best_month["month"])} was your strongest month at '
+                             f'{money(float(best_month["net"]))} profit (income {money(float(best_month["income"]))}). '
+                             f'Look at what was different that month.'})
+        if Decimal(worst_month['net']) < 0:
+            recs.append({'kind': 'alert', 'title': f'Worst month: {_month_label(worst_month["month"])}',
+                         'text': f'{_month_label(worst_month["month"])} lost {money(-float(worst_month["net"]))}'
+                                 + (f', mostly on {worst_month["top_expense"]} '
+                                    f'({money(float(worst_month["top_expense_amount"]))}).' if worst_month['top_expense'] else '.')})
+
+    if net_by_month[latest_mk] < 0:
+        recs.append({'kind': 'alert', 'title': f'{_month_label(latest_mk)}: spent more than earned',
+                     'text': f'This month expense was {money(exp_by_month[latest_mk])} vs income '
+                             f'{money(inc_by_month[latest_mk])} — a {money(-net_by_month[latest_mk])} gap.'})
+
+    if forecast['net'] < 0:
+        recs.append({'kind': 'alert', 'title': f'Next month may run negative',
+                     'text': f'Based on your last 3 months, {_month_label(forecast["month"])} is trending to a '
+                             f'{money(-forecast["net"])} shortfall. Plan cash accordingly.'})
+
+    if branch_ranking:
+        best = branch_ranking[0]
+        if best['net'] > 0:
+            recs.append({'kind': 'good', 'title': f'{best["branch"]} is your best branch',
+                         'text': f'{best["branch"]} made the most profit ({money(best["net"])}). '
+                                 f'Consider what is working there and replicate it.'})
+        # Only flag materially loss-making branches (ignore tiny data-quirk rows).
+        loss_branches = [b for b in branch_ranking if b['net'] < Decimal('-10000')]
+        for b in loss_branches[:2]:
+            recs.append({'kind': 'alert', 'title': f'{b["branch"]} is loss-making',
+                         'text': f'{b["branch"]} is down {money(-b["net"])} (income {money(b["income"])}, '
+                                 f'expense {money(b["expense"])}). Review its costs.'})
+
+    if top_expenses and total_expense > 0:
+        top = top_expenses[0]
+        if top['share'] >= 0.30:
+            recs.append({'kind': 'tip', 'title': f'{top["category"]} dominates your spend',
+                         'text': f'{top["category"]} alone is {round(top["share"] * 100)}% of total expense '
+                                 f'({money(float(top["total"]))}). Small savings here move the needle most.'})
+        for c in top_expenses:
+            if c['growth_pct'] is not None and c['growth_pct'] >= 40 and float(c['total']) >= 10000:
+                recs.append({'kind': 'alert', 'title': f'{c["category"]} rising fast',
+                             'text': f'{c["category"]} is up {c["growth_pct"]}% vs the previous 3 months. '
+                                     f'Check whether this is expected.'})
+                break
+
+    for a in anomalies[:2]:
+        recs.append({'kind': 'alert', 'title': f'{a["category"]} spiked this month',
+                     'text': f'{a["category"]} was {money(float(a["amount"]))} in {_month_label(a["month"])} — '
+                             f'{a["times"]}× its usual {money(float(a["avg"]))}. Worth a look.'})
+
+    # Branch dropdown list — canonical, de-duplicated, junk excluded (as in P&L).
+    branch_names = {}
+    for loc in Branch.objects.values_list('location', flat=True):
+        canon = _pnl_canonical(loc)
+        if canon.lower() in _PNL_EXCLUDED_BRANCHES:
+            continue
+        branch_names.setdefault(canon, canon.title())
+    all_branches = sorted(branch_names.values())
+
+    return Response({
+        'window_months': month_keys,
+        'window_label': f'{_month_label(month_keys[0])} – {_month_label(month_keys[-1])}',
+        'date_from': start.strftime('%Y-%m-%d'),
+        'date_to': end.strftime('%Y-%m-%d'),
+        'branches': all_branches,
+        'summary': {
+            'total_income': str(total_income),
+            'total_expense': str(total_expense),
+            'net_profit': str(net_profit),
+            'is_profit': net_profit >= 0,
+            'margin_pct': round(float(net_profit / total_income * 100), 1) if total_income > 0 else None,
+            'active_months': len(active_months),
+            'profit_months': profit_months,
+            'loss_months': loss_months,
+            'best_month': best_month['month'] if best_month else None,
+            'worst_month': worst_month['month'] if worst_month else None,
+            'latest_month': latest_mk,
+            'latest_income': str(inc_by_month[latest_mk]),
+            'latest_expense': str(exp_by_month[latest_mk]),
+            'latest_net': str(net_by_month[latest_mk]),
+        },
+        'monthly_breakdown': monthly_breakdown,
+        'monthly_trend': [
+            {'month': mk, 'income': str(inc_by_month[mk]), 'expense': str(exp_by_month[mk]), 'net': str(net_by_month[mk])}
+            for mk in month_keys
+        ],
+        'forecast': {k: (str(v) if isinstance(v, Decimal) else v) for k, v in forecast.items()},
+        'branch_ranking': [
+            {'branch': b['branch'], 'income': str(b['income']), 'expense': str(b['expense']), 'net': str(b['net'])}
+            for b in branch_ranking
+        ],
+        'top_expenses': top_expenses,
+        'anomalies': anomalies,
+        'recommendations': recs,
     })
 
 

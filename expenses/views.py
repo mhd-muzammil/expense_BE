@@ -3033,21 +3033,40 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 # these two systems — the same key the closed-call counts use — so
                 # this introduces no identity guess that the board did not already
                 # depend on.
-                oc_email = {}
+                # A name carrying two DIFFERENT emails in the roster is not a link,
+                # it is a coin toss, and the loser would be paid someone else's
+                # salary. Collect every email per name first, then use only the
+                # names that resolve to exactly one — the same standard the Payroll
+                # link below holds itself to. Inactive roster rows are skipped, as
+                # in the create loop above, so a stale record cannot win.
+                oc_names = {}
                 for oc in roster:
+                    if not oc.get('active', True):
+                        continue
                     em = (oc.get('email') or '').strip()
-                    name_key = (oc.get('name') or '').strip().lower()
+                    name_key = ' '.join(str(oc.get('name') or '').split()).lower()
                     if em and name_key:
-                        oc_email.setdefault(name_key, em)
+                        oc_names.setdefault(name_key, set()).add(em)
+                oc_email = {n: next(iter(v)) for n, v in oc_names.items() if len(v) == 1}
                 if oc_email:
+                    # Every engineer, not just the active ones: an email held by a
+                    # soft-hidden engineer is still that person's, and handing it to a
+                    # second row would quietly pay two people the same salary.
+                    all_engineers = list(EngineerPnl.objects.all())
+                    taken = {
+                        (e.email or '').strip().lower()
+                        for e in all_engineers if (e.email or '').strip()
+                    }
                     filled = []
-                    for eng in EngineerPnl.objects.filter(active=True):
-                        if (eng.email or '').strip():
+                    for eng in all_engineers:
+                        if not eng.active or (eng.email or '').strip():
                             continue
-                        em = oc_email.get(eng.engineer_name.strip().lower())
-                        if em:
-                            eng.email = em
-                            filled.append(eng)
+                        em = oc_email.get(' '.join((eng.engineer_name or '').split()).lower())
+                        if not em or em.lower() in taken:
+                            continue
+                        eng.email = em
+                        taken.add(em.lower())
+                        filled.append(eng)
                     if filled:
                         EngineerPnl.objects.bulk_update(filled, ['email'])
                         email_synced = len(filled)
@@ -3084,14 +3103,18 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 try:
                     blanks = [e for e in engineers if not (e.email or '').strip()]
                     if blanks:
+                        # Every engineer's email counts as taken, including soft-hidden
+                        # ones — the row is out of sight, the person is not.
                         taken = {
                             (e.email or '').strip().lower()
-                            for e in engineers if (e.email or '').strip()
+                            for e in EngineerPnl.objects.all() if (e.email or '').strip()
                         }
+                        # Count EVERY namesake, including those with no email. Skipping
+                        # them first would turn "two people share this name" into "one
+                        # match", and the guard below would wave through exactly the
+                        # ambiguity it exists to catch.
                         by_name = {}
                         for emp in payroll_client.get_employees():
-                            if not emp.get('email'):
-                                continue
                             key = ' '.join(str(emp.get('name') or '').split()).lower()
                             if key:
                                 by_name.setdefault(key, []).append(emp)
@@ -3101,8 +3124,8 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                             cands = by_name.get(key) or []
                             if len(cands) != 1:
                                 continue
-                            email = cands[0]['email'].strip()
-                            if email.lower() in taken:
+                            email = str(cands[0].get('email') or '').strip()
+                            if not email or email.lower() in taken:
                                 continue
                             eng.email = email
                             taken.add(email.lower())
@@ -3201,7 +3224,9 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             # their real pay. Surfaced so a silent mismatch can't quietly skew the
             # Profit/Loss column; fixed by setting the engineer's Payroll email.
             'email_synced': email_synced,
-            'payroll_auto_linked': payroll_auto_linked if payroll_ok else [],
+            # Reported unconditionally: these emails are already committed, and a
+            # later failure flipping payroll_ok must not hide a write that happened.
+            'payroll_auto_linked': payroll_auto_linked,
             'payroll_unmatched': (
                 [r['engineer_name'] for r in rows if r.get('salary_source') != 'payroll']
                 if payroll_ok else []

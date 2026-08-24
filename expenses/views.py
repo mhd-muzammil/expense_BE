@@ -2956,23 +2956,6 @@ class BOBStatementViewSet(_BankStatementViewSet):
 # ---------------------------------------------------------------------------
 # Engineer P&L — live profit/loss per engineer, closed-calls pulled from OpenCall
 # ---------------------------------------------------------------------------
-def _payroll_name_key(name):
-    """Loose match key for a person's name: lower-cased, bracketed qualifiers
-    dropped ("VIJAYAKUMAR (ark)" -> "vijayakumar"), punctuation flattened and
-    whitespace collapsed.
-
-    Used only as a LAST resort after email and exact-name matching, and only when
-    the key is unambiguous on both sides — this decides which salary an engineer
-    is paid, so a key shared by two people is treated as no match at all rather
-    than risking the wrong figure.
-    """
-    import re
-    s = str(name or '').lower()
-    s = re.sub(r'\([^)]*\)', ' ', s)     # drop "(ark)"-style qualifiers
-    s = re.sub(r'[^a-z0-9]+', ' ', s)    # dots/underscores/hyphens -> space
-    return ' '.join(s.split())
-
-
 class EngineerPnlViewSet(viewsets.ModelViewSet):
     """CRUD for each engineer's P&L parameters, plus a live ``/board/`` action
     that pulls the closed-call count per engineer from the OpenCall system and
@@ -3040,39 +3023,24 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
 
         engineers = list(self.get_queryset().filter(active=True))
 
-        # Pull real salary from the Payroll system and apply it to matched
-        # engineers (email first, then name). Payroll is the source of truth for
-        # salary when a match exists; best-effort so it never breaks the board.
+        # Pull real salary from the Payroll system and apply it to engineers
+        # matched BY EMAIL ONLY — an email identifies one person, a name does not.
+        # Payroll is the source of truth for salary when a match exists;
+        # best-effort so it never breaks the board.
         payroll_ok, payroll_message = None, ''
         salary_source = {}  # engineer id -> 'payroll' | 'manual'
         try:
             from . import payroll_client
             if payroll_client.is_configured():
                 sal = payroll_client.get_salaries()
-
-                # Last-resort loose-name index, built once. A normalised key is only
-                # usable when exactly one Payroll employee AND one board engineer
-                # carry it — otherwise two people would share a salary.
-                payroll_by_norm = {}
-                for p_name in sal['by_name']:
-                    payroll_by_norm.setdefault(_payroll_name_key(p_name), []).append(p_name)
-                board_norm_counts = {}
-                for eng in engineers:
-                    k = _payroll_name_key(eng.engineer_name)
-                    board_norm_counts[k] = board_norm_counts.get(k, 0) + 1
-
                 to_update = []
                 for eng in engineers:
+                    # Email ONLY. Names are not unique — two people can share one, and
+                    # matching on a name would silently pay an engineer someone else's
+                    # salary. An engineer with no matching email keeps their manual
+                    # figure and is reported in payroll_unmatched instead.
                     email_key = (eng.email or '').strip().lower()
-                    name_key = eng.engineer_name.strip().lower()
                     match = sal['by_email'].get(email_key) if email_key else None
-                    if match is None:
-                        match = sal['by_name'].get(name_key)
-                    if match is None:
-                        norm = _payroll_name_key(eng.engineer_name)
-                        candidates = payroll_by_norm.get(norm) or []
-                        if norm and len(candidates) == 1 and board_norm_counts.get(norm) == 1:
-                            match = sal['by_name'].get(candidates[0])
                     if match is not None:
                         salary_source[eng.id] = 'payroll'
                         new_sal = Decimal(str(match)).quantize(Decimal('0.01'))

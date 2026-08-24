@@ -3125,6 +3125,66 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             'unmatched_engineers': unmatched,
         })
 
+    @action(detail=False, methods=['get'], url_path='closed-calls')
+    def closed_calls(self, request):
+        """The individual closed calls behind a board close count.
+
+        Same window rules as ``/board/`` (from+to → month → today) and the same
+        graceful degradation: if OpenCall is unreachable this returns an empty list
+        with ``live_ok: false`` rather than erroring, so the drill-down can never
+        break the section. Pass ``engineer`` to scope to one person.
+
+        Each call carries Segment, Product Name, Work Location and WO OTC CODE.
+        OpenCall builds the list from the same shared productivity calculation the
+        counts come from, so the list always agrees with the number beside it.
+        """
+        from datetime import date
+        import calendar
+
+        month = request.query_params.get('month')     # 'YYYY-MM'
+        q_from = request.query_params.get('from')     # 'YYYY-MM-DD'
+        q_to = request.query_params.get('to')
+        try:
+            if q_from and q_to:
+                first = date.fromisoformat(q_from)
+                last = date.fromisoformat(q_to)
+                if first > last:
+                    first, last = last, first
+            elif month:
+                year, mon = int(month[:4]), int(month[5:7])
+                first = date(year, mon, 1)
+                last = date(year, mon, calendar.monthrange(year, mon)[1])
+            else:
+                first = last = date.today()
+        except (ValueError, IndexError):
+            return Response({'detail': 'Invalid date range.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        engineer = (request.query_params.get('engineer') or '').strip() or None
+
+        # Imported inside the try so even a missing dependency degrades into
+        # live_ok:false rather than a 500 — this drill-down must never be able to
+        # break the board it opens from.
+        live_ok, message, calls, meta = True, '', [], {}
+        try:
+            from . import opencall_client
+            res = opencall_client.get_closed_call_details(
+                first.isoformat(), last.isoformat(), engineer=engineer,
+            )
+            calls, meta = res['calls'], res['meta']
+        except Exception as e:  # unreachable / unconfigured / missing dep
+            live_ok = False
+            message = str(e) if e.__class__.__name__ == 'OpenCallError' else f'Could not reach OpenCall: {e}'
+
+        return Response({
+            'period': {'from': first.isoformat(), 'to': last.isoformat()},
+            'engineer': engineer or '',
+            'live_ok': live_ok,
+            'message': message,
+            'meta': meta,
+            'count': len(calls),
+            'calls': calls,
+        })
+
 
 # ---------------------------------------------------------------------------
 # Sleek Bill Invoice Register — import the Sleek Bill invoice export (.xls) and

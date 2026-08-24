@@ -14,6 +14,7 @@ OpenCall — it only reads the already-computed closed-call counts.
 """
 import os
 import threading
+from urllib.parse import quote
 
 import requests
 
@@ -135,5 +136,53 @@ def get_closed_counts(date_from, date_to):
             'reportDays': data.get('reportDays'),
             'workingDaysPerMonth': data.get('workingDaysPerMonth'),
             'monthlyTarget': data.get('monthlyTarget'),
+        },
+    }
+
+
+def get_closed_call_details(date_from, date_to, engineer=None):
+    """The individual closed calls behind ``get_closed_counts`` for the same range.
+
+    Each call carries the descriptive columns the Daily Call Plan Report holds for
+    it — Segment, Product Name, Work Location and WO OTC CODE — so the Engineer P&L
+    board can drill from a close count into the calls that produced it.
+
+    OpenCall derives the list from the SAME shared productivity calculation the
+    counts come from, so the two can never disagree. Pass ``engineer`` to scope the
+    list to one person. Returns ``{'calls': [...], 'meta': {...}}``; raises
+    OpenCallError on any failure, exactly like the other readers here.
+    """
+    if not is_configured():
+        raise OpenCallError(
+            "OpenCall credentials are not set. Configure OPENCALL_USERNAME and "
+            "OPENCALL_PASSWORD (a SUPER_ADMIN service account)."
+        )
+    path = f"/api/v1/engineer-target/closed-calls?from={date_from}&to={date_to}"
+    if engineer:
+        path += f"&engineer={quote(str(engineer))}"
+    payload = _get(path) or {}
+    data = payload.get('data') or {}
+    calls = []
+    for row in data.get('calls', []):
+        if not isinstance(row, dict):
+            continue
+        calls.append({
+            'date': row.get('date') or '',
+            'engineer': (row.get('engineer') or '').strip(),
+            'ticket_id': row.get('ticketId') or '',
+            'case_id': row.get('caseId') or '',
+            'segment': row.get('segment') or '',
+            'product_name': row.get('productName') or '',
+            'work_location': row.get('workLocation') or '',
+            'wo_otc_code': row.get('woOtcCode') or '',
+            'region_code': row.get('regionCode') or '',
+        })
+    return {
+        'calls': calls,
+        'meta': {
+            'fromDate': data.get('fromDate'),
+            'toDate': data.get('toDate'),
+            'reportDays': data.get('reportDays'),
+            'totalClosed': data.get('totalClosed'),
         },
     }

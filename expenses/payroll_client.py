@@ -14,6 +14,7 @@ on HTTP 401. This module never writes to Payroll — salary is read-only here.
 """
 import os
 import threading
+import time
 
 import requests
 
@@ -21,6 +22,14 @@ import requests
 _TIMEOUT = 15
 _token = {'value': None}
 _lock = threading.Lock()
+
+# The board asks for the employee list on every load to link engineers that still
+# have no email. Where a name never resolves, that is a full paginated walk of
+# Payroll forever, on a request that already walks it once for salaries. Salary
+# itself is never served from here — get_salaries stays uncached — so a stale entry
+# can only delay a NEW employee becoming pickable, never pay anyone a stale figure.
+_EMPLOYEE_TTL = 300  # seconds
+_employee_cache = {'at': None, 'rows': None}
 
 
 class PayrollError(Exception):
@@ -120,9 +129,9 @@ def get_salaries():
     return {'by_email': by_email, 'by_name': by_name}
 
 
-def get_employees():
+def get_employees(fresh=False):
     """Every Payroll employee as ``{'name', 'email', 'salary'}``, name and email
-    kept together.
+    kept together. Cached for a few minutes; pass ``fresh=True`` to bypass that.
 
     ``get_salaries`` deliberately returns lookups keyed for matching and so cannot
     say which email belongs to which person. This reader exists so the Engineer P&L
@@ -138,6 +147,11 @@ def get_employees():
             "Payroll credentials are not set. Configure PAYROLL_USERNAME and "
             "PAYROLL_PASSWORD (an admin/superadmin account)."
         )
+    if not fresh:
+        cached = _employee_cache['rows']
+        at = _employee_cache['at']
+        if cached is not None and at is not None and (time.monotonic() - at) < _EMPLOYEE_TTL:
+            return list(cached)
     out = []
     seen_emails = set()
     path = "/api/employees/?page_size=1000"
@@ -175,4 +189,6 @@ def get_employees():
         else:
             path = None
     out.sort(key=lambda r: (r['name'] or '').lower())
-    return out
+    _employee_cache['rows'] = out
+    _employee_cache['at'] = time.monotonic()
+    return list(out)

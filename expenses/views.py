@@ -3260,7 +3260,9 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         try:
             from . import payroll_client
             if payroll_client.is_configured():
-                employees = payroll_client.get_employees()
+                # Bypass the cache: someone opening the picker is looking for a
+                # person they may have just added in Payroll.
+                employees = payroll_client.get_employees(fresh=True)
             else:
                 ok = False
                 message = 'Payroll credentials not set (PAYROLL_USERNAME / PAYROLL_PASSWORD).'

@@ -118,3 +118,61 @@ def get_salaries():
         else:
             path = None
     return {'by_email': by_email, 'by_name': by_name}
+
+
+def get_employees():
+    """Every Payroll employee as ``{'name', 'email', 'salary'}``, name and email
+    kept together.
+
+    ``get_salaries`` deliberately returns lookups keyed for matching and so cannot
+    say which email belongs to which person. This reader exists so the Engineer P&L
+    edit form can offer the actual Payroll people to pick from — an engineer's email
+    is what salary matches on, and typing it by hand is where it goes wrong.
+
+    Employees with no email are still listed (so the absence is visible, rather than
+    the person appearing to be missing from Payroll). Follows DRF pagination; raises
+    PayrollError on failure.
+    """
+    if not is_configured():
+        raise PayrollError(
+            "Payroll credentials are not set. Configure PAYROLL_USERNAME and "
+            "PAYROLL_PASSWORD (an admin/superadmin account)."
+        )
+    out = []
+    seen_emails = set()
+    path = "/api/employees/?page_size=1000"
+    seen_pages = 0
+    while path and seen_pages < 50:
+        payload = _get(path)
+        seen_pages += 1
+        if isinstance(payload, dict) and 'results' in payload:
+            rows = payload.get('results') or []
+            nxt = payload.get('next')
+        else:
+            rows = payload if isinstance(payload, list) else []
+            nxt = None
+        for e in rows:
+            if not isinstance(e, dict):
+                continue
+            name = str(e.get('employee_name') or '').strip()
+            email = str(e.get('email') or '').strip()
+            if not name and not email:
+                continue
+            key = email.lower()
+            if key and key in seen_emails:
+                continue
+            if key:
+                seen_emails.add(key)
+            sal = e.get('salary')
+            try:
+                sal = float(sal) if sal not in (None, '') else None
+            except (TypeError, ValueError):
+                sal = None
+            out.append({'name': name, 'email': email, 'salary': sal})
+        if nxt:
+            base = _api_url()
+            path = nxt[len(base):] if nxt.startswith(base) else None
+        else:
+            path = None
+    out.sort(key=lambda r: (r['name'] or '').lower())
+    return out

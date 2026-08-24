@@ -3135,6 +3135,36 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             'unmatched_engineers': unmatched,
         })
 
+    @action(detail=False, methods=['get'], url_path='payroll-employees')
+    def payroll_employees(self, request):
+        """The Payroll people an engineer can be pointed at, name and email together.
+
+        Salary matches on email alone, and an email typed by hand is where that goes
+        wrong — one wrong character and the engineer silently keeps a default figure.
+        The edit form uses this to let the email be picked instead of typed.
+
+        Degrades like the board: an unreachable or unconfigured Payroll returns an
+        empty list with ok:false rather than erroring.
+        """
+        ok, message, employees = True, '', []
+        try:
+            from . import payroll_client
+            if payroll_client.is_configured():
+                employees = payroll_client.get_employees()
+            else:
+                ok = False
+                message = 'Payroll credentials not set (PAYROLL_USERNAME / PAYROLL_PASSWORD).'
+        except Exception as e:  # unreachable / unconfigured / missing dep
+            ok = False
+            message = str(e) if e.__class__.__name__ == 'PayrollError' else f'Could not reach Payroll: {e}'
+
+        return Response({
+            'ok': ok,
+            'message': message,
+            'count': len(employees),
+            'employees': employees,
+        })
+
     @action(detail=False, methods=['get'], url_path='closed-calls')
     def closed_calls(self, request):
         """The individual closed calls behind a board close count.

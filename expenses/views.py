@@ -3006,6 +3006,7 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         # manual entry. Non-destructive: only creates names never seen before
         # (a soft-hidden engineer — active=False — is NOT recreated). Best-effort.
         synced = 0
+        email_synced = 0
         if request.query_params.get('sync', '1') != '0':
             try:
                 roster = opencall_client.get_engineers()
@@ -3018,6 +3019,38 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 if to_add:
                     EngineerPnl.objects.bulk_create(to_add)
                     synced = len(to_add)
+
+                # Carry the roster's email onto engineers that predate it. The block
+                # above only reads an email while CREATING someone, so every engineer
+                # added before OpenCall held emails still carries a blank one — and a
+                # blank email is precisely what stops Payroll salary from reaching
+                # them. Filling it here is what makes an email added in OpenCall show
+                # up on this board without anyone retyping it.
+                #
+                # Only BLANK emails are filled. An email already on a record was put
+                # there deliberately and outranks the roster, so it is never
+                # overwritten. Matching is by name, which is already the link between
+                # these two systems — the same key the closed-call counts use — so
+                # this introduces no identity guess that the board did not already
+                # depend on.
+                oc_email = {}
+                for oc in roster:
+                    em = (oc.get('email') or '').strip()
+                    name_key = (oc.get('name') or '').strip().lower()
+                    if em and name_key:
+                        oc_email.setdefault(name_key, em)
+                if oc_email:
+                    filled = []
+                    for eng in EngineerPnl.objects.filter(active=True):
+                        if (eng.email or '').strip():
+                            continue
+                        em = oc_email.get(eng.engineer_name.strip().lower())
+                        if em:
+                            eng.email = em
+                            filled.append(eng)
+                    if filled:
+                        EngineerPnl.objects.bulk_update(filled, ['email'])
+                        email_synced = len(filled)
             except Exception:
                 pass  # roster sync is best-effort; never break the board
 
@@ -3028,11 +3061,61 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         # Payroll is the source of truth for salary when a match exists;
         # best-effort so it never breaks the board.
         payroll_ok, payroll_message = None, ''
+        payroll_auto_linked = []  # engineers whose blank email Payroll filled in
         salary_source = {}  # engineer id -> 'payroll' | 'manual'
         try:
             from . import payroll_client
             if payroll_client.is_configured():
                 sal = payroll_client.get_salaries()
+
+                # Fill in a BLANK email from Payroll when exactly one employee there
+                # carries this engineer's name. Salary still matches on email and only
+                # email — the name is used once, to propose the link, never to decide
+                # what someone is paid. An engineer who already has an email is left
+                # alone: a person's own entry is never overwritten by a guess.
+                #
+                # Guards, all of which must hold before a link is made:
+                #   - the engineer's email is empty
+                #   - exactly ONE Payroll employee has that name (two means unknowable)
+                #   - that employee's email is not already on another engineer
+                # Anything ambiguous is skipped and left for the picker in the edit form.
+                # Every link made is reported in payroll_auto_linked so it can be seen
+                # and corrected, rather than quietly deciding someone's salary.
+                try:
+                    blanks = [e for e in engineers if not (e.email or '').strip()]
+                    if blanks:
+                        taken = {
+                            (e.email or '').strip().lower()
+                            for e in engineers if (e.email or '').strip()
+                        }
+                        by_name = {}
+                        for emp in payroll_client.get_employees():
+                            if not emp.get('email'):
+                                continue
+                            key = ' '.join(str(emp.get('name') or '').split()).lower()
+                            if key:
+                                by_name.setdefault(key, []).append(emp)
+                        linked = []
+                        for eng in blanks:
+                            key = ' '.join((eng.engineer_name or '').split()).lower()
+                            cands = by_name.get(key) or []
+                            if len(cands) != 1:
+                                continue
+                            email = cands[0]['email'].strip()
+                            if email.lower() in taken:
+                                continue
+                            eng.email = email
+                            taken.add(email.lower())
+                            linked.append(eng)
+                            payroll_auto_linked.append({
+                                'engineer_name': eng.engineer_name,
+                                'email': email,
+                            })
+                        if linked:
+                            EngineerPnl.objects.bulk_update(linked, ['email'])
+                except Exception:
+                    pass  # a convenience only; never let it break the salary pull
+
                 to_update = []
                 for eng in engineers:
                     # Email ONLY. Names are not unique — two people can share one, and
@@ -3117,6 +3200,8 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             # reachable — i.e. the figure on screen is a manual/default value, not
             # their real pay. Surfaced so a silent mismatch can't quietly skew the
             # Profit/Loss column; fixed by setting the engineer's Payroll email.
+            'email_synced': email_synced,
+            'payroll_auto_linked': payroll_auto_linked if payroll_ok else [],
             'payroll_unmatched': (
                 [r['engineer_name'] for r in rows if r.get('salary_source') != 'payroll']
                 if payroll_ok else []

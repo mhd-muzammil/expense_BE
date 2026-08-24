@@ -168,7 +168,13 @@ def get_closed_call_details(date_from, date_to, engineer=None):
             continue
         calls.append({
             'date': row.get('date') or '',
+            # Raw report text, kept as-is.
             'engineer': (row.get('engineer') or '').strip(),
+            # The CANONICAL name — what the board and the closed-call counts call this
+            # person. OpenCall aliases some names ("Lava Kumar" is listed as "Lava"), so
+            # grouping these calls by the raw text silently loses an aliased engineer's
+            # calls. Falls back to the raw name for an OpenCall that predates the field.
+            'engineer_name': (row.get('engineerName') or row.get('engineer') or '').strip(),
             'ticket_id': row.get('ticketId') or '',
             'case_id': row.get('caseId') or '',
             'segment': row.get('segment') or '',

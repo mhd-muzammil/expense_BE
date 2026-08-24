@@ -2956,6 +2956,23 @@ class BOBStatementViewSet(_BankStatementViewSet):
 # ---------------------------------------------------------------------------
 # Engineer P&L — live profit/loss per engineer, closed-calls pulled from OpenCall
 # ---------------------------------------------------------------------------
+def _payroll_name_key(name):
+    """Loose match key for a person's name: lower-cased, bracketed qualifiers
+    dropped ("VIJAYAKUMAR (ark)" -> "vijayakumar"), punctuation flattened and
+    whitespace collapsed.
+
+    Used only as a LAST resort after email and exact-name matching, and only when
+    the key is unambiguous on both sides — this decides which salary an engineer
+    is paid, so a key shared by two people is treated as no match at all rather
+    than risking the wrong figure.
+    """
+    import re
+    s = str(name or '').lower()
+    s = re.sub(r'\([^)]*\)', ' ', s)     # drop "(ark)"-style qualifiers
+    s = re.sub(r'[^a-z0-9]+', ' ', s)    # dots/underscores/hyphens -> space
+    return ' '.join(s.split())
+
+
 class EngineerPnlViewSet(viewsets.ModelViewSet):
     """CRUD for each engineer's P&L parameters, plus a live ``/board/`` action
     that pulls the closed-call count per engineer from the OpenCall system and
@@ -3032,6 +3049,18 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             from . import payroll_client
             if payroll_client.is_configured():
                 sal = payroll_client.get_salaries()
+
+                # Last-resort loose-name index, built once. A normalised key is only
+                # usable when exactly one Payroll employee AND one board engineer
+                # carry it — otherwise two people would share a salary.
+                payroll_by_norm = {}
+                for p_name in sal['by_name']:
+                    payroll_by_norm.setdefault(_payroll_name_key(p_name), []).append(p_name)
+                board_norm_counts = {}
+                for eng in engineers:
+                    k = _payroll_name_key(eng.engineer_name)
+                    board_norm_counts[k] = board_norm_counts.get(k, 0) + 1
+
                 to_update = []
                 for eng in engineers:
                     email_key = (eng.email or '').strip().lower()
@@ -3039,6 +3068,11 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                     match = sal['by_email'].get(email_key) if email_key else None
                     if match is None:
                         match = sal['by_name'].get(name_key)
+                    if match is None:
+                        norm = _payroll_name_key(eng.engineer_name)
+                        candidates = payroll_by_norm.get(norm) or []
+                        if norm and len(candidates) == 1 and board_norm_counts.get(norm) == 1:
+                            match = sal['by_name'].get(candidates[0])
                     if match is not None:
                         salary_source[eng.id] = 'payroll'
                         new_sal = Decimal(str(match)).quantize(Decimal('0.01'))
@@ -3111,6 +3145,14 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             'synced': synced,
             'payroll_ok': payroll_ok,
             'payroll_message': payroll_message,
+            # Engineers whose salary did NOT come from Payroll while Payroll was
+            # reachable — i.e. the figure on screen is a manual/default value, not
+            # their real pay. Surfaced so a silent mismatch can't quietly skew the
+            # Profit/Loss column; fixed by setting the engineer's Payroll email.
+            'payroll_unmatched': (
+                [r['engineer_name'] for r in rows if r.get('salary_source') != 'payroll']
+                if payroll_ok else []
+            ),
             'show_all': show_all,
             'total_configured': len(all_rows),
             'meta': meta,

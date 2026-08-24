@@ -173,7 +173,11 @@ def get_closed_call_details(date_from, date_to, engineer=None):
             'case_id': row.get('caseId') or '',
             'segment': row.get('segment') or '',
             'product_name': row.get('productName') or '',
+            # Raw ASP code (e.g. "ASPS01463") and the same code resolved to its region
+            # name (e.g. "VELLORE") by OpenCall. The name is what a reader wants; the
+            # code is kept so nothing is lost if the mapping ever misses one.
             'work_location': row.get('workLocation') or '',
+            'work_location_name': row.get('workLocationName') or row.get('workLocation') or '',
             'wo_otc_code': row.get('woOtcCode') or '',
             'region_code': row.get('regionCode') or '',
         })

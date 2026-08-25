@@ -1119,7 +1119,7 @@ class EngineerPnl(models.Model):
             return Decimal('0.00')
         return (self.engg_salary / self.total_working_days).quantize(Decimal('0.01'))
 
-    def compute(self, closed_calls, period_days=None):
+    def compute(self, closed_calls, period_days=None, cycle_days=None):
         """Live P&L figures for the window being viewed.
 
         Engg Earning = calls closed IN THE WINDOW x per-call-rate.
@@ -1131,17 +1131,27 @@ class EngineerPnl(models.Model):
         made a 24-day window look 23 days more profitable than it is; only a
         one-day window came out right, and then by coincidence.
 
-        The one-day rate is engg_salary / total_working_days. A window longer than
-        the working month is not capped: if someone is viewed over 60 days they are
-        paid for 60 days, and pretending otherwise would understate the cost.
+        The daily rate divides the salary by the length of the SALARY CYCLE the
+        window sits in, not by total_working_days. A cycle runs the 25th to the
+        24th and so is 28-31 days long, while total_working_days is a fixed 30 -
+        so dividing by 30 and multiplying by a 31-day cycle charged 103% of a
+        salary that is only ever paid once. Against the real cycle length a full
+        cycle costs exactly one salary, and any part of it costs its share.
+
+        A window longer than a cycle is not capped: viewed over two cycles an
+        engineer is paid twice, and pretending otherwise would understate the cost.
         """
         closed = Decimal(str(closed_calls or 0))
         days = max(int(period_days or 1), 1)
+        # Fall back to the configured working month only when the caller cannot say
+        # how long the cycle was, so this stays correct if called from elsewhere.
+        cycle = max(int(cycle_days or self.total_working_days or 30), 1)
         awd = self.actual_working_days or 0
         actual_closed_pd = (closed / awd).quantize(Decimal('0.01')) if awd else Decimal('0.00')
         engg_earning = (closed * self.per_call_rate).quantize(Decimal('0.01'))
         one_day_salary = self.per_day
-        window_salary = (one_day_salary * days).quantize(Decimal('0.01'))
+        daily_rate = (self.engg_salary / cycle).quantize(Decimal('0.01'))
+        window_salary = (self.engg_salary * days / cycle).quantize(Decimal('0.01'))
         profit_loss = (engg_earning - window_salary).quantize(Decimal('0.01'))
         return {
             'closed_calls': int(closed),
@@ -1149,6 +1159,11 @@ class EngineerPnl(models.Model):
             'total_calls_closed_pm': int(closed),
             'per_day': str(one_day_salary),
             'period_days': days,
+            'cycle_days': cycle,
+            # What one day of this window actually costs: the salary spread over the
+            # cycle it belongs to. `per_day` stays the configured figure so the
+            # engineer's own settings still read back unchanged.
+            'daily_rate': str(daily_rate),
             'window_salary': str(window_salary),
             'engg_earning': str(engg_earning),
             'revenue': str(engg_earning),               # alias (Engg Earning)

@@ -1,5 +1,5 @@
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
@@ -3002,6 +3002,21 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
 
         period_days = (last - first).days + 1
 
+        # How long the salary cycle containing this window is. A cycle runs the
+        # 25th to the 24th, so its length swings between 28 and 31 days; charging a
+        # month's salary across a fixed 30 would bill 31/30 of it for a 31-day
+        # cycle. Measured from the window's END so a part-month is charged against
+        # the cycle it falls in.
+        if last.day >= 25:
+            _cyc_from = last.replace(day=25)
+            _nxt = (last.replace(day=1) + timedelta(days=32)).replace(day=1)
+            _cyc_to = _nxt.replace(day=24)
+        else:
+            _prev = (last.replace(day=1) - timedelta(days=1))
+            _cyc_from = _prev.replace(day=25)
+            _cyc_to = last.replace(day=24)
+        cycle_days = (_cyc_to - _cyc_from).days + 1
+
         # Auto-populate engineers from OpenCall's roster so they appear without
         # manual entry. Non-destructive: only creates names never seen before
         # (a soft-hidden engineer — active=False — is NOT recreated). Best-effort.
@@ -3177,7 +3192,7 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         all_rows = []
         for eng in engineers:
             closed = int(counts.get(eng.engineer_name.strip().lower(), 0))
-            calc = eng.compute(closed, period_days)
+            calc = eng.compute(closed, period_days, cycle_days)
             all_rows.append({
                 'id': eng.id,
                 'engineer_name': eng.engineer_name,
@@ -3232,6 +3247,7 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 if payroll_ok else []
             ),
             'period_days': period_days,
+            'cycle_days': cycle_days,
             'show_all': show_all,
             'total_configured': len(all_rows),
             'meta': meta,

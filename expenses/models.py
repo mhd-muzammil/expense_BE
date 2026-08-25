@@ -1098,7 +1098,7 @@ class EngineerPnl(models.Model):
     email = models.EmailField(blank=True, default='')
     engg_count = models.PositiveIntegerField(default=1)
     per_day_target = models.PositiveIntegerField(default=10)
-    per_call_rate = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('350'))
+    per_call_rate = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('420'))
     engg_salary = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('25000'))
     total_working_days = models.PositiveIntegerField(default=30)
     actual_working_days = models.PositiveIntegerField(default=25)

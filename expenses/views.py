@@ -3203,6 +3203,8 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         tot_rev = sum((Decimal(r['revenue']) for r in rows), Decimal('0.00'))
         tot_sal = sum((Decimal(r['total_engg_salary']) for r in rows), Decimal('0.00'))
         tot_nett = sum((Decimal(r['nett']) for r in rows), Decimal('0.00'))
+        tot_nett_week = sum((Decimal(r['nett_week']) for r in rows), Decimal('0.00'))
+        tot_nett_full = sum((Decimal(r['nett_full']) for r in rows), Decimal('0.00'))
 
         # Engineers OpenCall reports that aren't configured here yet (so the user
         # can add them and start earning revenue for their closes).
@@ -3241,6 +3243,8 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 'revenue': str(tot_rev),
                 'total_engg_salary': str(tot_sal),
                 'nett': str(tot_nett),
+                'nett_week': str(tot_nett_week),
+                'nett_full': str(tot_nett_full),
             },
             'unmatched_engineers': unmatched,
         })

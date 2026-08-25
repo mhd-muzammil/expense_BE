@@ -1125,13 +1125,26 @@ class EngineerPnl(models.Model):
         Engg Earning = closed calls × per-call-rate.
         Profit/Loss  = Engg Earning − one-day salary (engg salary ÷ total working
         days). period_days is kept for call-signature compatibility but no longer
-        changes the figures."""
+        changes the figures.
+
+        The same earning is also measured against a week of pay and against the
+        FULL salary. One day answers "did this engineer cover their cost today";
+        a week answers it over a week; the full salary answers "have they covered
+        their pay for the month". All three are returned so none has to be
+        inferred from another.
+
+        A week is seven times the same per-day figure the board already shows,
+        rather than a quarter of the salary — so the three columns are read off
+        one rate and always agree with each other."""
         closed = Decimal(str(closed_calls or 0))
         awd = self.actual_working_days or 0
         actual_closed_pd = (closed / awd).quantize(Decimal('0.01')) if awd else Decimal('0.00')
         engg_earning = (closed * self.per_call_rate).quantize(Decimal('0.01'))
         one_day_salary = self.per_day
         profit_loss = (engg_earning - one_day_salary).quantize(Decimal('0.01'))
+        profit_loss_full = (engg_earning - self.engg_salary).quantize(Decimal('0.01'))
+        week_salary = (one_day_salary * 7).quantize(Decimal('0.01'))
+        profit_loss_week = (engg_earning - week_salary).quantize(Decimal('0.01'))
         return {
             'closed_calls': int(closed),
             'actual_closed_pd': str(actual_closed_pd),
@@ -1142,6 +1155,11 @@ class EngineerPnl(models.Model):
             'total_engg_salary': str(self.engg_salary),
             'profit_loss': str(profit_loss),
             'nett': str(profit_loss),                    # alias (Profit/Loss)
+            'week_salary': str(week_salary),
+            'profit_loss_week': str(profit_loss_week),
+            'nett_week': str(profit_loss_week),          # alias (Profit/Loss vs a week's salary)
+            'profit_loss_full': str(profit_loss_full),
+            'nett_full': str(profit_loss_full),          # alias (Profit/Loss vs full salary)
         }
 
 

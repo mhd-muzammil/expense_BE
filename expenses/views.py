@@ -1,6 +1,6 @@
 import csv
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
 from django.contrib.auth import authenticate
@@ -17,7 +17,7 @@ from rest_framework.pagination import PageNumberPagination
 
 from .models import (
     Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, SleekBillInvoice, Subscription, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION, SECTION_INSIGHTS,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION, SECTION_INSIGHTS, SECTION_COLLECTIONS,
 )
 from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer, SleekBillInvoiceSerializer, SubscriptionSerializer
 
@@ -3567,3 +3567,282 @@ class SubscriptionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(active=True)
         return qs.order_by('renewal_date', 'id')
 
+
+
+# ---------------------------------------------------------------------------
+# Collections — who owes us, how long they have owed it, and how to ask
+# ---------------------------------------------------------------------------
+
+# Aging buckets, freshest first. The last one is open-ended because "over 90
+# days" is a single decision, not a range.
+_AGING_BUCKETS = (
+    ('0-30', 0, 30),
+    ('31-60', 31, 60),
+    ('61-90', 61, 90),
+    ('90+', 91, None),
+)
+_AGING_LABELS = tuple(b[0] for b in _AGING_BUCKETS)
+
+
+def _collections_bucket(days):
+    """The aging bucket an overdue age falls in. Never returns None."""
+    for label, lo, hi in _AGING_BUCKETS:
+        if days >= lo and (hi is None or days <= hi):
+            return label
+    return _AGING_LABELS[0]
+
+
+def _wa_phone(raw):
+    """An Indian mobile as WhatsApp wants it — ``91XXXXXXXXXX`` — or '' when the
+    stored value cannot be trusted to be one.
+
+    These fields hold whatever was typed: spaces, +91, a leading 0, landlines,
+    sometimes two numbers in one box. Guessing at a malformed one would open a
+    chat with a stranger and show them another customer's balance, so anything
+    not unambiguously a 10-digit Indian mobile returns empty and the UI simply
+    offers no button.
+    """
+    digits = ''.join(ch for ch in str(raw or '') if ch.isdigit())
+    if len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    elif len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    elif len(digits) == 13 and digits.startswith('091'):
+        digits = digits[3:]
+    if len(digits) != 10:
+        return ''
+    # Indian mobile numbers start 6-9; a landline or a mistyped number does not.
+    return f'91{digits}' if digits[0] in '6789' else ''
+
+
+# Legal-form spellings that are the same word, not the same guess. "Ltd" and
+# "Limited" name one company; nothing here merges two names that merely look
+# alike, so a real second customer can never be folded into another's debt.
+_CLIENT_SYNONYMS = (
+    (' limited', ' ltd'),
+    (' private', ' pvt'),
+    (' & ', ' and '),
+)
+
+
+def _client_key(name):
+    """A grouping key for a client name, tolerant of how it was typed.
+
+    Sleek Bill holds the same customer four ways - "KEC International Ltd",
+    "... Ltd,", "... Ltd." and "KEC INTERNATIONAL LIMITED" - so a rollup on the
+    raw text splits one debtor into four rows and hides who actually owes the
+    most. Case, spacing and trailing punctuation carry no meaning in a company
+    name, so they are removed; beyond that only the exact synonyms above apply.
+    """
+    key = ' '.join(str(name or '').split()).lower().strip(' .,;:-')
+    for a, b in _CLIENT_SYNONYMS:
+        key = key.replace(a, b)
+    return ' '.join(key.split()).strip(' .,;:-')
+
+
+def _collections_queryset():
+    """Invoices with money still outstanding. A zero or negative balance is not a
+    debt, so credit notes and settled bills never appear."""
+    return SleekBillInvoice.objects.filter(balance__gt=0)
+
+
+def _overdue_days(inv, today):
+    """How long this money has been owed.
+
+    An invoice with no due date is aged from when it was issued — a bill nobody
+    put a term on is still owed from the day it went out, and treating it as
+    current would hide the oldest debts of all.
+    """
+    ref = inv.due_date or inv.issue_date
+    return (today - ref).days if ref else 0
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireSection(SECTION_COLLECTIONS)])
+def collections_view(request):
+    """Outstanding receivables, rolled up per client.
+
+    Query params (all optional):
+      search  – case-insensitive substring of the client name.
+      bucket  – one of 0-30 / 31-60 / 61-90 / 90+; keeps only clients with money
+                in that bucket, and reports each client's balance WITHIN it.
+      min     – hide clients owing less than this.
+    """
+    today = datetime.now().date()
+    search = (request.query_params.get('search') or '').strip()
+    bucket_filter = (request.query_params.get('bucket') or '').strip()
+    if bucket_filter not in _AGING_LABELS:
+        bucket_filter = ''
+    try:
+        min_balance = Decimal(str(request.query_params.get('min') or '0'))
+    except (InvalidOperation, ValueError, ArithmeticError):
+        min_balance = Decimal('0')
+
+    # Company-wide totals come from EVERY invoice, not only the unpaid ones —
+    # "collected" means nothing without the paid ones in the denominator. These
+    # deliberately ignore the filters: they are the fixed backdrop a filtered
+    # view is read against.
+    every = SleekBillInvoice.objects.aggregate(
+        billed=Coalesce(Sum('total'), Decimal('0.00')),
+        collected=Coalesce(Sum('amount_paid'), Decimal('0.00')),
+    )
+    # Owed money only. Summing every balance nets credit notes against debts, so
+    # the headline would not equal the rows beneath it and the gap would look
+    # like a bug. Credit notes are reported separately instead of vanishing.
+    owed = _collections_queryset().aggregate(
+        t=Coalesce(Sum('balance'), Decimal('0.00')))['t']
+    credit = SleekBillInvoice.objects.filter(balance__lt=0).aggregate(
+        t=Coalesce(Sum('balance'), Decimal('0.00')))['t']
+
+    qs = _collections_queryset()
+    unpaid_total = qs.count()
+    if search:
+        qs = qs.filter(client_name__icontains=search)
+
+    aging = {label: {'bucket': label, 'count': 0, 'amount': Decimal('0.00')}
+             for label in _AGING_LABELS}
+    clients = {}
+    overdue_count = 0
+    overdue_amount = Decimal('0.00')
+
+    for inv in qs.iterator():
+        bal = inv.balance or Decimal('0.00')
+        days = _overdue_days(inv, today)
+        overdue = days > 0
+        label = _collections_bucket(max(days, 0))
+
+        aging[label]['count'] += 1
+        aging[label]['amount'] += bal
+        if overdue:
+            overdue_count += 1
+            overdue_amount += bal
+
+        name = ' '.join(str(inv.client_name or '').split()) or '(no client name)'
+        key = _client_key(name) or name.lower()
+        c = clients.get(key)
+        if c is None:
+            c = clients[key] = {
+                'client_name': name,
+                'spellings': {},
+                'balance': Decimal('0.00'),
+                'bill_count': 0,
+                'oldest_days': 0,
+                'oldest_invoice': '',
+                'phone': '',
+                'whatsapp': '',
+                'email': '',
+                'city': (inv.client_city or '').strip(),
+                'gstin': (inv.client_gstin or '').strip(),
+                'buckets': {lab: Decimal('0.00') for lab in _AGING_LABELS},
+            }
+        c['balance'] += bal
+        c['bill_count'] += 1
+        c['buckets'][label] += bal
+        c['spellings'][name] = c['spellings'].get(name, 0) + 1
+        if days > c['oldest_days']:
+            c['oldest_days'] = days
+            c['oldest_invoice'] = inv.invoice_number or ''
+        # Older invoices often predate a contact being recorded, so take the
+        # first value that is actually usable rather than the first one seen.
+        if not c['whatsapp']:
+            wa = _wa_phone(inv.client_phone)
+            if wa:
+                c['whatsapp'] = wa
+                c['phone'] = (inv.client_phone or '').strip()
+        if not c['email'] and (inv.client_email or '').strip():
+            c['email'] = inv.client_email.strip()
+
+    # Label each client with the spelling that appears on the most invoices, so
+    # the name shown is the one their paperwork actually uses. Every variant is
+    # still reported, because a reader deserves to see WHY four rows became one.
+    for c in clients.values():
+        variants = sorted(c.pop('spellings').items(), key=lambda kv: (-kv[1], -len(kv[0])))
+        c['client_name'] = variants[0][0] if variants else c['client_name']
+        c['name_variants'] = [n for n, _ in variants]
+
+    rows = list(clients.values())
+    if bucket_filter:
+        # Report what they owe IN this bucket. Listing a client's whole balance
+        # when the reader asked for 90+ would overstate the ask by whatever is
+        # not yet that old.
+        rows = [dict(r, balance=r['buckets'][bucket_filter])
+                for r in rows if r['buckets'][bucket_filter] > 0]
+    if min_balance > 0:
+        rows = [r for r in rows if r['balance'] >= min_balance]
+    rows.sort(key=lambda r: r['balance'], reverse=True)
+
+    for r in rows:
+        r['buckets'] = {k: str(v) for k, v in r['buckets'].items()}
+        r['balance'] = str(r['balance'])
+
+    return Response({
+        'as_of': today.isoformat(),
+        'summary': {
+            'billed': str(every['billed']),
+            'collected': str(every['collected']),
+            'outstanding': str(owed),
+            'credit_notes': str(credit),
+            'unpaid_invoices': unpaid_total,
+            'overdue_invoices': overdue_count,
+            'overdue_amount': str(overdue_amount),
+            'clients_owing': len(clients),
+        },
+        'aging': [
+            {'bucket': label,
+             'count': aging[label]['count'],
+             'amount': str(aging[label]['amount'])}
+            for label in _AGING_LABELS
+        ],
+        'clients': rows,
+        'filters': {'search': search, 'bucket': bucket_filter, 'min': str(min_balance)},
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireSection(SECTION_COLLECTIONS)])
+def collections_invoices_view(request):
+    """The unpaid invoices behind one client's balance, oldest debt first.
+
+    ``client`` is matched exactly (case-insensitively) against the name the
+    rollup grouped on, so this list can never disagree with the total beside it.
+    """
+    client = (request.query_params.get('client') or '').strip()
+    if not client:
+        return Response({'detail': 'client is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    today = datetime.now().date()
+    # Match on the SAME key the rollup groups by, not on the exact string. An
+    # exact match would list only one of this client's spellings, so the total
+    # here would fall short of the board's — and the reminder built from this
+    # list would ask them for less than they owe.
+    key = _client_key(client) or client.lower()
+    qs = [i for i in _collections_queryset()
+          if (_client_key(i.client_name) or (i.client_name or '').lower()) == key]
+    qs.sort(key=lambda i: _overdue_days(i, today), reverse=True)
+
+    invoices, total, whatsapp = [], Decimal('0.00'), ''
+    for inv in qs:
+        days = max(_overdue_days(inv, today), 0)
+        total += inv.balance or Decimal('0.00')
+        if not whatsapp:
+            whatsapp = _wa_phone(inv.client_phone)
+        invoices.append({
+            'id': inv.id,
+            'invoice_number': inv.invoice_number or '',
+            'issue_date': inv.issue_date.isoformat() if inv.issue_date else '',
+            'due_date': inv.due_date.isoformat() if inv.due_date else '',
+            'days_overdue': days,
+            'bucket': _collections_bucket(days),
+            'total': str(inv.total or 0),
+            'amount_paid': str(inv.amount_paid or 0),
+            'balance': str(inv.balance or 0),
+            'status': inv.status or '',
+        })
+
+    return Response({
+        'client_name': client,
+        'count': len(invoices),
+        'balance': str(total),
+        'whatsapp': whatsapp,
+        'invoices': invoices,
+    })

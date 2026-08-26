@@ -10,7 +10,12 @@ come from the environment (nothing hardcoded, no other config touched):
 
 Auth is SimpleJWT: POST /api/auth/login/ {"username","password"} -> {"access"};
 send ``Authorization: Bearer <access>``. Token cached in memory, re-login once
-on HTTP 401. This module never writes to Payroll — salary is read-only here.
+on HTTP 401.
+
+Everything here reads except one call: ``decide_request`` posts an approve or
+reject to Payroll's own endpoint. It does not write a decision locally — the
+outcome, the reviewer and the timestamp are recorded by Payroll, so the two
+systems can never disagree about who allowed what. Salary is read-only.
 """
 import os
 import threading
@@ -81,6 +86,64 @@ def _get(path):
     if resp.status_code != 200:
         raise PayrollError(f"Payroll GET {path} failed (HTTP {resp.status_code}).")
     return resp.json()
+
+
+def _post(path, payload=None):
+    """Authenticated POST with a single re-login retry on 401.
+
+    Raises PayrollError carrying Payroll's own message on a 4xx, so a refusal it
+    makes deliberately — "this request was already approved" — reaches the caller
+    as that sentence rather than a generic failure.
+    """
+    with _lock:
+        token = _token['value'] or _login()
+    url = f"{_api_url()}{path}"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    resp = requests.post(url, json=payload or {}, headers=headers, timeout=_TIMEOUT)
+    if resp.status_code == 401:
+        with _lock:
+            token = _login()
+        headers['Authorization'] = f'Bearer {token}'
+        resp = requests.post(url, json=payload or {}, headers=headers, timeout=_TIMEOUT)
+    if resp.status_code not in (200, 201):
+        detail = ''
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                detail = str(body.get('detail') or '')
+        except Exception:
+            pass
+        raise PayrollError(detail or f"Payroll POST {path} failed (HTTP {resp.status_code}).")
+    return resp.json()
+
+
+def decide_request(request_id, decision, note=''):
+    """Approve or reject one employee request, in Payroll.
+
+    The decision is made BY PAYROLL: it sets the status, stamps the reviewer and
+    the time, and drops the outcome into the request's own conversation so the
+    employee sees it. Nothing about the decision is stored on this side, which is
+    what keeps the two systems from telling different stories.
+
+    Payroll refuses a request that is not still Pending, so two people deciding
+    the same one cannot both succeed — the second gets Payroll's own refusal.
+
+    ``note`` should say who decided it here: Payroll records the reviewer as the
+    service account this client logs in with, so without it the trail would stop
+    at a shared login instead of a person.
+    """
+    if decision not in ('approve', 'reject'):
+        raise PayrollError("Decision must be 'approve' or 'reject'.")
+    if not is_configured():
+        raise PayrollError(
+            "Payroll credentials are not set. Configure PAYROLL_USERNAME and "
+            "PAYROLL_PASSWORD (an admin/superadmin account)."
+        )
+    try:
+        rid = int(request_id)
+    except (TypeError, ValueError):
+        raise PayrollError("Invalid request id.")
+    return _post(f"/api/requests/{rid}/{decision}/", {'note': (note or '').strip()})
 
 
 def get_salaries():

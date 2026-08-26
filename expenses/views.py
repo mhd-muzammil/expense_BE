@@ -3961,3 +3961,48 @@ def staff_requests_view(request):
         'requests': rows,
         'filters': {'status': status_param, 'request_type': type_param, 'search': search},
     })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, RequireSection(SECTION_STAFFREQ)])
+def staff_request_decide_view(request, pk):
+    """Approve or reject one employee request — by asking Payroll to do it.
+
+    Nothing is written here. Payroll sets the status, stamps the reviewer and the
+    time, and posts the outcome into the request's own conversation, so the two
+    systems can never end up telling different stories about who allowed what.
+
+    Payroll refuses anything that is not still Pending, so two people deciding the
+    same request cannot both succeed; the second is told it was already decided.
+
+    Body: {"action": "approve" | "reject", "note": "optional reason"}
+    """
+    action_param = (request.data.get('action') or '').strip().lower()
+    if action_param not in ('approve', 'reject'):
+        return Response({'detail': "action must be 'approve' or 'reject'."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    note = (request.data.get('note') or '').strip()
+
+    # Payroll records the reviewer as the service account this backend logs in
+    # with, which is shared. Naming the real person in the note keeps the trail
+    # pointing at a human instead of stopping at a shared login.
+    who = getattr(request.user, 'username', '') or 'a user'
+    verb = 'Approved' if action_param == 'approve' else 'Rejected'
+    stamped = f"{verb} by {who} from the Expense Tracker."
+    if note:
+        stamped = f"{stamped} {note}"
+
+    try:
+        from . import payroll_client
+        data = payroll_client.decide_request(pk, action_param, stamped)
+    except Exception as e:
+        # A refusal Payroll made on purpose ("already approved") is the caller's
+        # answer, not a server error, so it comes back as 400 with that sentence.
+        msg = str(e) if e.__class__.__name__ == 'PayrollError' else f'Could not reach Payroll: {e}'
+        return Response({'ok': False, 'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({
+        'ok': True,
+        'detail': f'Request {action_param}d in Payroll.',
+        'request': data,
+    })

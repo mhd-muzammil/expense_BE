@@ -17,7 +17,7 @@ from rest_framework.pagination import PageNumberPagination
 
 from .models import (
     Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, DeliveryChallan, PurchaseBill, PurchaseOrder, PaymentReceipt, Quote, BillOfSupply, TaxInvoice, BankStatementEntry, EngineerPnl, SleekBillInvoice, Subscription, AppSetting,
-    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION, SECTION_INSIGHTS, SECTION_COLLECTIONS,
+    UserProfile, ALL_SECTIONS, SECTION_DASHBOARD, SECTION_EXPENSES, SECTION_PNL, SECTION_REGION, SECTION_INVOICE, SECTION_CHALLAN, SECTION_PURCHASE, SECTION_PORDER, SECTION_RECEIPT, SECTION_PETTYCASH, SECTION_QUOTE, SECTION_BOS, SECTION_TAXINVOICE, SECTION_IDFC, SECTION_BOB, SECTION_ENGPNL, SECTION_SBINVOICE, SECTION_SUBSCRIPTION, SECTION_INSIGHTS, SECTION_COLLECTIONS, SECTION_STAFFREQ,
 )
 from .serializers import BranchSerializer, ExpenseSerializer, ExpenseCreateSerializer, PaymentModeBalanceSerializer, BillingReminderSerializer, PettyCashDebitSerializer, InvoiceSerializer, DeliveryChallanSerializer, PurchaseBillSerializer, PurchaseOrderSerializer, PaymentReceiptSerializer, QuoteSerializer, BillOfSupplySerializer, TaxInvoiceSerializer, BankStatementEntrySerializer, EngineerPnlSerializer, SleekBillInvoiceSerializer, SubscriptionSerializer
 
@@ -3863,4 +3863,101 @@ def collections_invoices_view(request):
         'balance': str(total),
         'whatsapp': whatsapp,
         'invoices': invoices,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Staff Requests — what employees have asked the office for, from Payroll
+# ---------------------------------------------------------------------------
+
+# The types that ask for money. A "report" is raised to be read, not paid, so it
+# is never counted into an amount.
+_STAFFREQ_MONEY_TYPES = ('salary_advance', 'petrol_advance', 'other_amount')
+_STAFFREQ_STATUSES = ('Pending', 'Approved', 'Rejected')
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireSection(SECTION_STAFFREQ)])
+def staff_requests_view(request):
+    """Employee money requests raised in the Payroll system.
+
+    Deliberately separate from Collections: that section is money customers owe
+    US, this is money OUR OWN PEOPLE have asked for. Adding these rows there
+    would mix a debt with a request and make both totals meaningless.
+
+    Read-only. Approve and Reject stay in Payroll, where the decision is recorded
+    against the reviewer who made it — a second approve button here would leave
+    two systems disagreeing about who allowed what.
+
+    Query params (all optional):
+      status        Pending / Approved / Rejected
+      request_type  salary_advance / petrol_advance / other_amount / report
+      search        case-insensitive substring of employee name, branch or reason
+    """
+    status_param = (request.query_params.get('status') or '').strip()
+    if status_param not in _STAFFREQ_STATUSES:
+        status_param = ''
+    type_param = (request.query_params.get('request_type') or '').strip()
+    if type_param not in _STAFFREQ_MONEY_TYPES + ('report',):
+        type_param = ''
+    search = (request.query_params.get('search') or '').strip().lower()
+
+    ok, message, rows = True, '', []
+    try:
+        from . import payroll_client
+        if payroll_client.is_configured():
+            rows = payroll_client.get_employee_requests(
+                status=status_param or None,
+                request_type=type_param or None,
+            )
+        else:
+            ok = False
+            message = 'Payroll credentials not set (PAYROLL_USERNAME / PAYROLL_PASSWORD).'
+    except Exception as e:  # unreachable / unconfigured / missing dep
+        ok = False
+        message = str(e) if e.__class__.__name__ == 'PayrollError' else f'Could not reach Payroll: {e}'
+
+    if search:
+        rows = [
+            r for r in rows
+            if search in f"{r['employee_name']} {r['branch']} {r['reason']}".lower()
+        ]
+
+    # Summarised over what came back, so the figures always describe the rows on
+    # screen rather than a wider set the reader cannot see.
+    def money(rs):
+        total = sum((Decimal(str(r['amount'])) for r in rs if r.get('amount')), Decimal('0'))
+        return total.quantize(Decimal('0.01'))
+
+    by_status = {}
+    for st in _STAFFREQ_STATUSES:
+        subset = [r for r in rows if r['status'] == st]
+        by_status[st] = {'count': len(subset), 'amount': str(money(subset))}
+
+    by_type = []
+    for t in _STAFFREQ_MONEY_TYPES + ('report',):
+        subset = [r for r in rows if r['request_type'] == t]
+        if subset:
+            by_type.append({
+                'request_type': t,
+                'label': subset[0]['request_type_label'] or t,
+                'count': len(subset),
+                'amount': str(money(subset)),
+            })
+
+    pending = [r for r in rows if r['status'] == 'Pending']
+    return Response({
+        'ok': ok,
+        'message': message,
+        'count': len(rows),
+        'summary': {
+            'total_amount': str(money(rows)),
+            'pending_count': len(pending),
+            'pending_amount': str(money(pending)),
+            'by_status': by_status,
+            'employees': len({r['employee_name'].lower() for r in rows if r['employee_name']}),
+        },
+        'by_type': by_type,
+        'requests': rows,
+        'filters': {'status': status_param, 'request_type': type_param, 'search': search},
     })

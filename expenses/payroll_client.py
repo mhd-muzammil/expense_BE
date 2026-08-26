@@ -192,3 +192,70 @@ def get_employees(fresh=False):
     _employee_cache['rows'] = out
     _employee_cache['at'] = time.monotonic()
     return list(out)
+
+
+def get_employee_requests(status=None, request_type=None):
+    """What employees have asked the office for, from Payroll's request section.
+
+    Returns a list of dicts: name, branch, type (and its label), amount, reason,
+    status, who reviewed it and when, and when it was raised.
+
+    Read-only, like everything else here. Approving or rejecting stays in Payroll,
+    where the decision is recorded against the reviewer — a second place to press
+    approve would leave two systems disagreeing about who allowed what.
+
+    Follows DRF pagination; raises PayrollError on failure.
+    """
+    if not is_configured():
+        raise PayrollError(
+            "Payroll credentials are not set. Configure PAYROLL_USERNAME and "
+            "PAYROLL_PASSWORD (an admin/superadmin account)."
+        )
+    qs = ["page_size=500"]
+    if status:
+        qs.append(f"status={status}")
+    if request_type:
+        qs.append(f"request_type={request_type}")
+    path = "/api/requests/?" + "&".join(qs)
+
+    out = []
+    seen_pages = 0
+    while path and seen_pages < 50:
+        payload = _get(path)
+        seen_pages += 1
+        if isinstance(payload, dict) and 'results' in payload:
+            rows = payload.get('results') or []
+            nxt = payload.get('next')
+        else:
+            rows = payload if isinstance(payload, list) else []
+            nxt = None
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            amt = r.get('amount')
+            try:
+                amt = float(amt) if amt not in (None, '') else None
+            except (TypeError, ValueError):
+                amt = None
+            out.append({
+                'id': r.get('id'),
+                'employee_name': str(r.get('employee_name') or '').strip(),
+                'branch': str(r.get('branch') or '').strip(),
+                'request_type': str(r.get('request_type') or '').strip(),
+                'request_type_label': str(r.get('request_type_label') or r.get('request_type') or '').strip(),
+                # None for a report: it is raised to be read, not paid.
+                'amount': amt,
+                'reason': str(r.get('reason') or '').strip(),
+                'status': str(r.get('status') or '').strip(),
+                'reviewed_by': str(r.get('reviewed_by_name') or '').strip(),
+                'reviewed_at': r.get('reviewed_at') or '',
+                'created_at': r.get('created_at') or '',
+                # The conversation itself stays in Payroll; only its size is useful here.
+                'message_count': len(r.get('messages') or []),
+            })
+        if nxt:
+            base = _api_url()
+            path = nxt[len(base):] if nxt.startswith(base) else None
+        else:
+            path = None
+    return out

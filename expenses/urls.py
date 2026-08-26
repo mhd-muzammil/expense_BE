@@ -31,6 +31,7 @@ urlpatterns = [
     path('profit-loss/', views.profit_loss_view, name='profit-loss'),
     path('insights/', views.insights_view, name='insights'),
     path('collections/', views.collections_view, name='collections'),
+    path('staff-requests/', views.staff_requests_view, name='staff-requests'),
     path('collections/invoices/', views.collections_invoices_view, name='collections-invoices'),
     path('payment-mode-balances/', views.payment_mode_balances_view, name='payment-mode-balances'),
     path('payment-mode-balances/set/', views.payment_mode_balance_set, name='payment-mode-balance-set'),

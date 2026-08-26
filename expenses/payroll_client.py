@@ -263,9 +263,9 @@ def get_employee_requests(status=None, request_type=None):
     Returns a list of dicts: name, branch, type (and its label), amount, reason,
     status, who reviewed it and when, and when it was raised.
 
-    Read-only, like everything else here. Approving or rejecting stays in Payroll,
-    where the decision is recorded against the reviewer — a second place to press
-    approve would leave two systems disagreeing about who allowed what.
+    Reading only. The decision itself goes through ``decide_request``, which asks
+    Payroll to record it rather than writing a status here — so the two systems
+    can never disagree about who allowed what.
 
     Follows DRF pagination; raises PayrollError on failure.
     """

@@ -3885,9 +3885,10 @@ def staff_requests_view(request):
     US, this is money OUR OWN PEOPLE have asked for. Adding these rows there
     would mix a debt with a request and make both totals meaningless.
 
-    Read-only. Approve and Reject stay in Payroll, where the decision is recorded
-    against the reviewer who made it — a second approve button here would leave
-    two systems disagreeing about who allowed what.
+    This view only reads. Approving and rejecting go through
+    ``staff_request_decide_view``, which asks Payroll to record the decision
+    rather than writing a status here, so the two systems can never disagree
+    about who allowed what — and is admin-only, which this is not.
 
     Query params (all optional):
       status        Pending / Approved / Rejected
@@ -3964,9 +3965,20 @@ def staff_requests_view(request):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated, RequireSection(SECTION_STAFFREQ)])
+# Admin ONLY, and deliberately a stricter gate than the board it sits beside.
+#
+# Payroll refuses this decision to anyone who is not superadmin/admin/hr — but that
+# check sees the SERVICE ACCOUNT this backend logs in with, not the person who
+# pressed the button. Gating on the section alone would hand Payroll's own
+# permission to anyone merely allowed to LOOK at the queue, and Payroll would
+# record an admin approving what an admin never approved. The section stays what
+# it was, "can see the requests"; approving money needs more than that.
+@permission_classes([IsAuthenticated, IsAdminSection, RequireSection(SECTION_STAFFREQ)])
 def staff_request_decide_view(request, pk):
     """Approve or reject one employee request — by asking Payroll to do it.
+
+    Admin only. See the permission note above: the section grants sight of the
+    queue, not authority over it.
 
     Nothing is written here. Payroll sets the status, stamps the reviewer and the
     time, and posts the outcome into the request's own conversation, so the two
@@ -4003,6 +4015,8 @@ def staff_request_decide_view(request, pk):
 
     return Response({
         'ok': True,
-        'detail': f'Request {action_param}d in Payroll.',
+        # 'reject' + 'd' is not a word, and this sentence is the operator's only
+        # confirmation that a production write happened.
+        'detail': f"Request {'approved' if action_param == 'approve' else 'rejected'} in Payroll.",
         'request': data,
     })

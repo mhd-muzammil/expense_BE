@@ -1122,7 +1122,7 @@ class EngineerPnl(models.Model):
         return (self.engg_salary / self.total_working_days).quantize(Decimal('0.01'))
 
     def compute(self, closed_calls, period_days=None, cycle_days=None, actual_working_days=None, raw=None,
-                paid_days=None):
+                earned_salary=None):
         """Live P&L figures for the window being viewed.
 
         Engg Earning = calls closed IN THE WINDOW x per-call-rate.
@@ -1157,11 +1157,12 @@ class EngineerPnl(models.Model):
         engg_earning = (closed * self.per_call_rate).quantize(Decimal('0.01'))
         one_day_salary = self.per_day
         daily_rate = (self.engg_salary / cycle).quantize(Decimal('0.01'))
-        # What the engineer actually earns for the window: every day is paid
-        # (Sundays included) except working days they missed. Without attendance
-        # the whole window is charged.
-        paid = days if paid_days is None else max(min(int(paid_days), days), 0)
-        window_salary = (self.engg_salary * paid / cycle).quantize(Decimal('0.01'))
+        # The board passes what Payroll would pay for the window (salary_calc);
+        # without it the whole window is charged at the cycle's day rate.
+        if earned_salary is not None:
+            window_salary = Decimal(str(earned_salary)).quantize(Decimal('0.01'))
+        else:
+            window_salary = (self.engg_salary * days / cycle).quantize(Decimal('0.01'))
         profit_loss = (engg_earning - window_salary).quantize(Decimal('0.01'))
         # The same window priced at what HP pays per call (raw_rates), shown next
         # to the flat per-call rate rather than replacing it.
@@ -1172,10 +1173,9 @@ class EngineerPnl(models.Model):
         raw_profit_loss = (raw_earning - window_salary).quantize(Decimal('0.01'))
         return {
             'closed_calls': int(closed),
-            'actual_closed_pd': str(actual_closed_pd),
+            # None when there are no days to divide by -- shown as a dash, not 0.00.
+            'actual_closed_pd': str(actual_closed_pd) if awd else None,
             'actual_working_days_used': awd,
-            'paid_days': paid,
-            'absent_days': days - paid,
             'raw_rate': str(raw_rate),
             'raw_earning': str(raw_earning),
             'raw_profit_loss': str(raw_profit_loss),

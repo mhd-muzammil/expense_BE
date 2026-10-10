@@ -206,14 +206,17 @@ def get_working_days(date_from, date_to):
             "PAYROLL_PASSWORD (an admin/superadmin account)."
         )
     payload = _get(f"/api/attendance/working_days/?start_date={date_from}&end_date={date_to}") or {}
-    by_email = {}
+    by_email, rows = {}, {}
     for row in payload.get('results') or []:
         if not isinstance(row, dict):
             continue
         email = str(row.get('email') or '').strip().lower()
         if email:
             by_email[email] = int(row.get('present_days') or 0)
-    return {'working_days': int(payload.get('working_days') or 0), 'by_email': by_email}
+            # The payslip-style counts (absent / casual leave / LOP / unmarked) and
+            # the cycle's payslip, when Payroll has them.
+            rows[email] = row
+    return {'working_days': int(payload.get('working_days') or 0), 'by_email': by_email, 'rows': rows}
 
 
 def get_employees(fresh=False):

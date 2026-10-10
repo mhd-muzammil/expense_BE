@@ -178,36 +178,54 @@ class BoardTests(TestCase):
         self.assertEqual(res.status_code, 200, res.content)
         return res.data
 
-    def test_salary_is_docked_for_missed_working_days(self):
-        # 25 Aug - 24 Sep 2026: 31 days, 27 working. Praveen was present 24, so
-        # 3 working days are cut: paid for 28 of 31 days. Sundays stay paid.
-        data = self._board({'working_days': 27, 'by_email': {'praveen@x.in': 24}})
+    @staticmethod
+    def _wd(**praveen):
+        """Payroll's working_days answer with one row for Praveen."""
+        row = {'present_days': 0, 'absent_days': 0, 'casual_leave_days': 0, 'lop_days': 0,
+               'unmarked_days': 0, 'payslip': None, **praveen}
+        return {'working_days': 27, 'by_email': {'praveen@x.in': row['present_days']},
+                'rows': {'praveen@x.in': row}}
+
+    def test_only_days_marked_absent_are_unpaid(self):
+        # 25 Aug - 24 Sep 2026: 31 days, 27 working. 3 marked Absent, one of them
+        # covered by casual leave: 2 unpaid, so 29 of 31 days are paid.
+        data = self._board(self._wd(present_days=22, absent_days=3, casual_leave_days=1, lop_days=2,
+                                    unmarked_days=2))
         rows = {r['engineer_name']: r for r in data['rows']}
         p = rows['Praveen']
-        self.assertEqual((p['paid_days'], p['absent_days']), (28, 3))
-        self.assertEqual(p['window_salary'], '28000.00')        # 31000 / 31 x 28
-        self.assertEqual(p['nett'], str(Decimal(p['engg_earning']) - Decimal('28000.00')))
-        # Not linked to Payroll: no attendance, so the whole window is charged.
-        self.assertEqual((rows['Jeeva']['paid_days'], rows['Jeeva']['window_salary']), (31, '31000.00'))
+        self.assertEqual((p['charged_days'], p['paid_days'], p['absent_days']), (31, 29, 2))
+        self.assertEqual((p['absent_marked'], p['casual_leave_days'], p['unmarked_days']), (3, 1, 2))
+        self.assertEqual(p['window_salary'], '29000.00')        # 31000 / 31 x 29
+        self.assertEqual(p['salary_basis'], 'attendance')
+        self.assertEqual(p['nett'], str(Decimal(p['engg_earning']) - Decimal('29000.00')))
+        self.assertEqual((p['total_working_days'], p['actual_working_days'], p['actual_closed_pd']), (27, 22, '0.09'))
+        # Not linked to Payroll: no attendance, so every day is charged.
+        j = rows['Jeeva']
+        self.assertEqual((j['paid_days'], j['window_salary'], j['salary_basis']), (31, '31000.00', 'manual'))
+        self.assertIsNone(j['actual_working_days'])
 
-    def test_days_not_yet_over_are_never_docked(self):
+    def test_a_finished_cycle_uses_its_payslip(self):
+        slip = {'status': 'Paid', 'paid_days': '29.00', 'lop_days': '3.00', 'casual_leave_used': '1.00',
+                'earned': '30123.45'}
+        data = self._board(self._wd(present_days=24, absent_days=3, lop_days=2, payslip=slip))
+        p = {r['engineer_name']: r for r in data['rows']}['Praveen']
+        self.assertEqual((p['window_salary'], p['salary_basis'], p['absent_days']), ('30123.45', 'payslip', 2))
+
+    def test_salary_is_only_charged_up_to_today(self):
+        from datetime import date as _date, timedelta as _td
+        today = _date.today()
+        data = self._board(self._wd(present_days=3),
+                           rng=((today - _td(days=2)).isoformat(), (today + _td(days=10)).isoformat()))
+        p = {r['engineer_name']: r for r in data['rows']}['Praveen']
+        self.assertEqual((data['charged_to'], p['charged_days']), (today.isoformat(), 3))
+        self.assertEqual(data['period_days'], 13)
+
+    def test_a_future_window_charges_nothing(self):
         from datetime import date as _date, timedelta as _td
         start = _date.today() + _td(days=1)
-        data = self._board({'working_days': 6, 'by_email': {'praveen@x.in': 0}},
-                           rng=(start.isoformat(), (start + _td(days=6)).isoformat()))
+        data = self._board(self._wd(), rng=(start.isoformat(), (start + _td(days=6)).isoformat()))
         p = {r['engineer_name']: r for r in data['rows']}['Praveen']
-        self.assertEqual((p['paid_days'], p['absent_days']), (7, 0))
-
-    def test_working_days_from_payroll(self):
-        data = self._board({'working_days': 27, 'by_email': {'praveen@x.in': 20}})
-        rows = {r['engineer_name']: r for r in data['rows']}
-        self.assertEqual(rows['Praveen']['total_working_days'], 27)
-        self.assertEqual(rows['Praveen']['actual_working_days'], 20)
-        self.assertEqual(rows['Praveen']['working_days_source'], 'payroll')
-        self.assertEqual(rows['Praveen']['actual_closed_pd'], '0.10')
-        # No email: keeps the configured figures.
-        self.assertEqual(rows['Jeeva']['actual_working_days'], 25)
-        self.assertEqual(rows['Jeeva']['working_days_source'], 'manual')
+        self.assertEqual((p['charged_days'], p['window_salary'], data['charged_to']), (0, '0.00', None))
 
     def test_payroll_down_falls_back(self):
         data = self._board()
@@ -215,7 +233,7 @@ class BoardTests(TestCase):
         self.assertTrue(all(r['working_days_source'] == 'manual' for r in data['rows']))
 
     def test_raw_columns_and_regions(self):
-        data = self._board({'working_days': 27, 'by_email': {}})
+        data = self._board({'working_days': 27, 'by_email': {}, 'rows': {}})
         p = {r['engineer_name']: r for r in data['rows']}['Praveen']
         # WO-1 actual 400 + WO-NEW estimated 350 → 750 over 2 calls.
         self.assertEqual(p['raw_earning'], '750.00')
@@ -231,3 +249,56 @@ class BoardTests(TestCase):
             sorted((e['engineer_name'], e['calls'], e['value']) for e in salem['engineers']),
             [('Jeeva', 1, '350.00'), ('Praveen', 1, '400.00')],
         )
+
+
+class SalaryCalcTests(TestCase):
+    """The salary rules on their own, one edge case at a time."""
+    from datetime import date as D
+
+    def _seg(self, a, b, row=None, email='e@x.in'):
+        from expenses import salary_calc
+        segs = []
+        for s_, e_, cs, ce in salary_calc.segments(a, b):
+            segs.append({'start': s_, 'end': e_, 'cycle_start': cs, 'cycle_end': ce,
+                         'rows': {email: row} if row is not None else {}})
+        return segs
+
+    def test_cycle_bounds(self):
+        from expenses.salary_calc import cycle_bounds
+        D = self.D
+        self.assertEqual(cycle_bounds(D(2026, 10, 10)), (D(2026, 9, 25), D(2026, 10, 24)))
+        self.assertEqual(cycle_bounds(D(2026, 10, 25)), (D(2026, 10, 25), D(2026, 11, 24)))
+        self.assertEqual(cycle_bounds(D(2027, 1, 3)), (D(2026, 12, 25), D(2027, 1, 24)))   # across a year
+        self.assertEqual(cycle_bounds(D(2028, 3, 1)), (D(2028, 2, 25), D(2028, 3, 24)))    # leap Feb: 29 days
+
+    def test_a_range_across_two_cycles_uses_each_cycles_rate(self):
+        from expenses.salary_calc import engineer_salary
+        D = self.D
+        # 20-29 Sep: 5 days of the Sep cycle (31 days) + 5 of the Oct cycle (30 days).
+        segs = self._seg(D(2026, 9, 20), D(2026, 9, 29), row={'lop_days': 0})
+        self.assertEqual(len(segs), 2)
+        res = engineer_salary(Decimal('30000'), segs, 'e@x.in')
+        expected = (Decimal('30000') * 5 / 31 + Decimal('30000') * 5 / 30).quantize(Decimal('0.01'))
+        self.assertEqual(res['earned'], expected)
+        self.assertEqual((res['charged_days'], res['paid_days']), (10, 10))
+
+    def test_users_example(self):
+        from expenses.salary_calc import engineer_salary
+        D = self.D
+        # 26,207 a month, 31-day cycle, 2 days unpaid: 29 paid days.
+        segs = self._seg(D(2026, 8, 25), D(2026, 9, 24), row={'lop_days': 2})
+        self.assertEqual(engineer_salary(Decimal('26207'), segs, 'e@x.in')['earned'], Decimal('24516.23'))
+
+    def test_unpaid_days_never_exceed_the_days_charged(self):
+        from expenses.salary_calc import engineer_salary
+        D = self.D
+        segs = self._seg(D(2026, 10, 10), D(2026, 10, 10), row={'lop_days': 5})
+        res = engineer_salary(Decimal('30000'), segs, 'e@x.in')
+        self.assertEqual((res['earned'], res['paid_days'], res['lop_days']), (Decimal('0.00'), 0, 1))
+
+    def test_unlinked_engineer_is_charged_every_day(self):
+        from expenses.salary_calc import engineer_salary
+        D = self.D
+        segs = self._seg(D(2026, 8, 25), D(2026, 9, 24), row={'lop_days': 9})
+        res = engineer_salary(Decimal('31000'), segs, None)
+        self.assertEqual((res['earned'], res['basis']), (Decimal('31000.00'), 'manual'))

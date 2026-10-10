@@ -3178,32 +3178,37 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             payroll_ok = False
             payroll_message = f'Could not reach Payroll: {e}'
 
-        # Real working days from Payroll attendance, matched by email like salary.
-        # Total WD = the window less Sundays; Actual WD = days the person was
-        # present. Anyone without a match keeps their configured figures.
-        #
-        # Salary is then charged for the days actually paid: every day of the
-        # window (Sundays are paid holidays) less the working days the engineer
-        # missed. Only days that are over count as missed — through yesterday —
-        # so today and the rest of a running cycle are never docked before the
-        # attendance for them can exist.
-        wd_ok, wd_message, wd_total, wd_by_email = None, '', None, {}
-        past_present, past_wd = {}, 0
-        att_end = min(last, date.today() - timedelta(days=1))
+        # Salary is charged the way Payroll pays it (see salary_calc): only for
+        # days up to today, split at salary-cycle boundaries, each part from that
+        # cycle's payslip when one exists, otherwise from attendance -- every day
+        # paid except days marked Absent, less casual leave. Engineers Payroll
+        # cannot match by email are charged every day at their configured salary.
+        from . import salary_calc
+        today = date.today()
+        charged_from, charged_to = salary_calc.charged_window(first, last, today)
+        segs = []
+        if charged_from:
+            segs = [{'start': a, 'end': b, 'cycle_start': cs, 'cycle_end': ce, 'rows': None}
+                    for a, b, cs, ce in salary_calc.segments(charged_from, charged_to)]
+        wd_ok, wd_message = None, ''
         try:
             from . import payroll_client
             if payroll_client.is_configured():
-                wd = payroll_client.get_working_days(first.isoformat(), last.isoformat())
-                wd_total, wd_by_email, wd_ok = wd['working_days'], wd['by_email'], True
-                if att_end >= first:
-                    past = wd if att_end == last else payroll_client.get_working_days(first.isoformat(), att_end.isoformat())
-                    past_present = past['by_email']
-                    past_wd = sum(1 for i in range((att_end - first).days + 1)
-                                  if (first + timedelta(days=i)).weekday() != 6)
+                for seg in segs:
+                    seg['rows'] = payroll_client.get_working_days(
+                        seg['start'].isoformat(), seg['end'].isoformat())['rows']
+                wd_ok = True
             else:
                 wd_ok = False
         except Exception as e:
-            wd_ok, wd_message = False, f'Could not read working days from Payroll: {e}'
+            wd_ok, wd_message = False, f'Could not read attendance from Payroll: {e}'
+            for seg in segs:
+                seg['rows'] = None
+        linked_emails = set()
+        for seg in segs:
+            linked_emails.update((seg['rows'] or {}).keys())
+        window_working_days = salary_calc.working_days(first, last)
+        charged_days = sum((seg['end'] - seg['start']).days + 1 for seg in segs)
 
         # Live pull of closed-call counts (name-keyed, case-insensitive).
         live_ok, message, counts, display, meta = True, '', {}, {}, {}
@@ -3243,13 +3248,13 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             key = eng.engineer_name.strip().lower()
             closed = int(counts.get(key, 0))
             email_key = (eng.email or '').strip().lower()
-            present = wd_by_email.get(email_key) if email_key else None
-            paid_days = None
-            if present is not None:
-                absent = max(0, past_wd - past_present.get(email_key, 0))
-                paid_days = period_days - absent
-            calc = eng.compute(closed, period_days, cycle_days, actual_working_days=present,
-                               raw=raw_by_eng.get(key), paid_days=paid_days)
+            linked = bool(email_key) and email_key in linked_emails
+            sal = salary_calc.engineer_salary(eng.engg_salary, segs, email_key if linked else None)
+            # Calls per day worked: present days when Payroll knows them, else the
+            # working days charged so far.
+            per_day_divisor = sal['present_days'] if linked else sal['working_days']
+            calc = eng.compute(closed, period_days, cycle_days, actual_working_days=per_day_divisor,
+                               raw=raw_by_eng.get(key), earned_salary=sal['earned'])
             all_rows.append({
                 'id': eng.id,
                 'engineer_name': eng.engineer_name,
@@ -3258,9 +3263,18 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 'per_day_target': eng.per_day_target,
                 'per_call_rate': str(eng.per_call_rate),
                 'engg_salary': str(eng.engg_salary),
-                'total_working_days': wd_total if present is not None else eng.total_working_days,
-                'actual_working_days': present if present is not None else eng.actual_working_days,
-                'working_days_source': 'payroll' if present is not None else 'manual',
+                # Working days charged so far (Sundays out) and of the whole window.
+                'total_working_days': sal['working_days'],
+                'window_working_days': window_working_days,
+                'actual_working_days': sal['present_days'] if linked else None,
+                'working_days_source': 'payroll' if linked else 'manual',
+                'charged_days': sal['charged_days'],
+                'paid_days': sal['paid_days'],
+                'absent_days': sal['lop_days'],
+                'absent_marked': sal['absent_marked'],
+                'casual_leave_days': sal['casual_leave_days'],
+                'unmarked_days': sal['unmarked_days'],
+                'salary_basis': sal['basis'],
                 # The engineer's own configured figures, for the edit form — saving
                 # the form must not turn this window's attendance into a setting.
                 'manual_total_working_days': eng.total_working_days,
@@ -3327,7 +3341,11 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             'unmatched_engineers': unmatched,
             'working_days_ok': wd_ok,
             'working_days_message': wd_message,
-            'working_days_total': wd_total,
+            'working_days_total': window_working_days,
+            # Salary is only charged up to today; these say which days that is.
+            'charged_from': charged_from.isoformat() if charged_from else None,
+            'charged_to': charged_to.isoformat() if charged_to else None,
+            'charged_days': charged_days,
             'raw_ok': raw_ok,
             'raw_message': raw_message,
             'raw_status': raw_rates.status() if raw_ok else None,

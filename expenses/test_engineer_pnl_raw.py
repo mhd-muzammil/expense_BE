@@ -92,6 +92,62 @@ class RawRateTests(TestCase):
         self.assertEqual(regions, {'SALEM': '400.00', 'CHENNAI': '350.00', 'HOSUR': '300.00'})
 
 
+class DashboardSyncTests(TestCase):
+    """The raw data follows rawdata.systimus.in's work_orders.json on its own."""
+    COLS = ['Category', 'Ticket No', 'Case Id', 'WO OTC Code', 'Product Name', 'Business Segment',
+            'Work Location', 'WO Closed', 'Call Classification', 'ASP City', 'Total PO Value',
+            'TOTAL PO VALUE', 'PO REMARK']
+
+    def _feed(self, value=400):
+        return {'generated': '2026-10-17 10:00', 'cols': self.COLS, 'rows': [
+            ['Print', 'WO-1', 5144887942, INSTALL, TANK, 'Printing', 'ASPS01465', '2026-09-01', 'INSTALL', 'Salem', 1, value, 'PO ISSUED'],
+            ['ARC', 'RENDERWAYS-ARC', '', 'ARC', '', '', '', '', '', '', 0, 400, 'PO TO BE ISSUED'],
+        ]}
+
+    def _resp(self, code=200, payload=None, etag='W/"abc"'):
+        r = mock.Mock(status_code=code, headers={'ETag': etag})
+        r.json.return_value = payload
+        return r
+
+    def test_first_sync_loads_the_feed(self):
+        with mock.patch('requests.get', return_value=self._resp(payload=self._feed())) as get:
+            res = raw_rates.sync_from_dashboard()
+        self.assertTrue(res['ok'])
+        self.assertEqual((res['created'], res['skipped']), (1, 1))
+        rec = FlexRawRecord.objects.get(ticket_no='WO-1')
+        # The exact TOTAL PO VALUE, not the dashboard's derived "Total PO Value".
+        self.assertEqual((rec.case_id, rec.po_value, rec.closed_on), ('5144887942', Decimal('400.00'), date(2026, 9, 1)))
+        self.assertEqual(get.call_args.args[0], 'https://rawdata.systimus.in/work_orders.json')
+        self.assertEqual(raw_rates.status()['generated'], '2026-10-17 10:00')
+
+    def test_unchanged_feed_is_not_downloaded_again(self):
+        with mock.patch('requests.get', return_value=self._resp(payload=self._feed())):
+            raw_rates.sync_from_dashboard()
+        from expenses.models import FlexRawSync
+        FlexRawSync.objects.filter(pk=1).update(checked_at=None)
+        with mock.patch('requests.get', return_value=self._resp(code=304)) as get:
+            res = raw_rates.sync_from_dashboard()
+        self.assertEqual(res, {'ok': True, 'unchanged': True})
+        self.assertEqual(get.call_args.kwargs['headers'], {'If-None-Match': 'W/"abc"'})
+
+    def test_checked_at_most_every_30_minutes_unless_forced(self):
+        with mock.patch('requests.get', return_value=self._resp(payload=self._feed())):
+            raw_rates.sync_from_dashboard()
+        with mock.patch('requests.get', return_value=self._resp(payload=self._feed(450))) as get:
+            self.assertEqual(raw_rates.sync_from_dashboard(), {'ok': True, 'busy': True})
+            get.assert_not_called()
+            res = raw_rates.sync_from_dashboard(force=True)
+        self.assertEqual(res['updated'], 1)
+        self.assertEqual(FlexRawRecord.objects.get(ticket_no='WO-1').po_value, Decimal('450.00'))
+
+    def test_a_failed_sync_is_reported_not_raised(self):
+        with mock.patch('requests.get', return_value=self._resp(code=500)):
+            res = raw_rates.sync_from_dashboard()
+        self.assertFalse(res['ok'])
+        self.assertIn('HTTP 500', raw_rates.status()['sync_error'])
+        self.assertEqual(FlexRawRecord.objects.count(), 0)
+
+
 class BoardTests(TestCase):
     def setUp(self):
         raw_rates.import_workbook(_workbook([_raw('WO-1', 400), _raw('WO-2', 350), _raw('WO-3', 300)]), 't.xlsx')
@@ -112,6 +168,7 @@ class BoardTests(TestCase):
              mock.patch('expenses.opencall_client.get_closed_counts', return_value={
                  'counts': {'praveen': 2, 'jeeva': 1}, 'display': {}, 'meta': {}}), \
              mock.patch('expenses.opencall_client.get_closed_call_details', return_value={'calls': calls, 'meta': {}}), \
+             mock.patch('expenses.raw_rates.sync_in_background'), \
              mock.patch('expenses.payroll_client.is_configured', return_value=True), \
              mock.patch('expenses.payroll_client.get_salaries', return_value={'by_email': {}, 'by_name': {}}), \
              mock.patch('expenses.payroll_client.get_employees', return_value=[]), \

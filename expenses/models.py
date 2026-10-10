@@ -1222,6 +1222,22 @@ class FlexRawRecord(models.Model):
         return f"{self.ticket_no} {self.product_name[:30]}"
 
 
+class FlexRawSync(models.Model):
+    """Single row (pk=1) recording the sync of FlexRawRecord from the raw-data
+    dashboard's work_orders.json: when it was last checked and loaded, the ETag
+    that makes an unchanged file cheap, and the last error if one happened."""
+    etag = models.CharField(max_length=200, blank=True, default='')
+    generated = models.CharField(max_length=64, blank=True, default='')
+    checked_at = models.DateTimeField(null=True, blank=True)
+    synced_at = models.DateTimeField(null=True, blank=True)
+    running_since = models.DateTimeField(null=True, blank=True)
+    last_result = models.CharField(max_length=200, blank=True, default='')
+    last_error = models.CharField(max_length=500, blank=True, default='')
+
+    def __str__(self):
+        return f"Flex raw sync (synced {self.synced_at})"
+
+
 class SleekBillInvoice(models.Model):
     """A single invoice imported from the Sleek Bill export (.xls). Mirrors the
     Sleek Bill invoice list so the Invoice Register section shows the same data.

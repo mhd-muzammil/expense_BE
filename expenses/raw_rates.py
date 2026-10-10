@@ -20,14 +20,16 @@ approved but not yet paid, which is where the newest month always sits), so
 they are HP's pricing and not ours.
 """
 import datetime
+import os
 import re
 import threading
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, Max
+from django.db.models import Count, Max, Q
+from django.utils import timezone
 
-from .models import FlexRawRecord
+from .models import FlexRawRecord, FlexRawSync
 
 
 # ASP code → region. Same map the Flex dashboard and OpenCall use.
@@ -99,24 +101,10 @@ def _text(v, limit):
     return str(v).strip()[:limit]
 
 
-def import_workbook(file_obj, source_name=''):
-    """Upsert every work order in a Flex raw export. Returns a summary dict.
-
-    Rows without a Ticket No, or without a product (the month-end ARC /
-    accessories lines HP appends), are not calls and are skipped."""
-    import openpyxl
-
-    wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
-    sheet, header = None, None
-    for ws in wb.worksheets:
-        first = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-        names = [str(h).strip() if h is not None else '' for h in (first or [])]
-        if _REQUIRED.issubset(names) and (header is None or len(names) > len(header)):
-            sheet, header = ws, names
-    if sheet is None:
-        wb.close()
-        raise ValueError('This is not a Flex raw export: Ticket No / Product Name / TOTAL PO VALUE columns not found.')
-
+def _records(header, rows, source_name):
+    """Turn a header + row iterator (Excel sheet or the dashboard's JSON) into
+    FlexRawRecord objects keyed by ticket. Rows without a Ticket No, or without a
+    product (the month-end ARC / accessories lines HP appends), are not calls."""
     col = {}
     for i, h in enumerate(header):
         col.setdefault(h, i)  # the export repeats some headers; the first wins
@@ -127,7 +115,7 @@ def import_workbook(file_obj, source_name=''):
 
     parsed = {}
     skipped = 0
-    for row in sheet.iter_rows(min_row=2, values_only=True):
+    for row in rows:
         ticket = _text(g(row, 'Ticket No'), 120).upper()
         product = _text(g(row, 'Product Name'), 300)
         if not ticket or not product:
@@ -147,14 +135,16 @@ def import_workbook(file_obj, source_name=''):
             po_remark=_text(g(row, 'PO REMARK'), 120).upper(),
             source_file=(source_name or '')[:255],
         )
-    wb.close()
+    return parsed, skipped
 
+
+def _upsert(parsed, skipped):
     fields = ['case_id', 'product_name', 'wo_otc_code', 'business_segment',
               'call_classification', 'work_location', 'asp_city', 'closed_on',
               'po_value', 'po_remark']
     with transaction.atomic():
         # Each export repeats every earlier call, so most rows are already here
-        # unchanged. Writing only the new and the changed ones keeps an upload to
+        # unchanged. Writing only the new and the changed ones keeps an import to
         # seconds; rewriting all ~14k took close to a minute, near the worker timeout.
         existing = {
             row[0]: row[1:]
@@ -172,12 +162,128 @@ def import_workbook(file_obj, source_name=''):
         # bulk_update skips auto_now, so stamp the import time here.
         FlexRawRecord.objects.bulk_update(to_update, fields + ['source_file'], batch_size=500)
         if to_update:
-            from django.utils import timezone
             FlexRawRecord.objects.filter(id__in=[r.id for r in to_update]).update(imported_at=timezone.now())
     _cache['key'] = None
     return {
         'rows': len(parsed), 'created': len(to_create), 'updated': len(to_update),
         'unchanged': len(parsed) - len(to_create) - len(to_update), 'skipped': skipped,
+    }
+
+
+def import_workbook(file_obj, source_name=''):
+    """Upsert every work order in a Flex raw export (.xlsx). Returns a summary dict."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
+    sheet, header = None, None
+    for ws in wb.worksheets:
+        first = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        names = [str(h).strip() if h is not None else '' for h in (first or [])]
+        if _REQUIRED.issubset(names) and (header is None or len(names) > len(header)):
+            sheet, header = ws, names
+    if sheet is None:
+        wb.close()
+        raise ValueError('This is not a Flex raw export: Ticket No / Product Name / TOTAL PO VALUE columns not found.')
+    parsed, skipped = _records(header, sheet.iter_rows(min_row=2, values_only=True), source_name)
+    wb.close()
+    return _upsert(parsed, skipped)
+
+
+def import_table(payload, source_name=''):
+    """Upsert from the raw-data dashboard's work_orders.json: {cols: [...], rows: [[...]]}.
+    The dashboard keeps HP's own column names, so the same mapping applies."""
+    cols = [str(c).strip() for c in (payload or {}).get('cols') or []]
+    if not _REQUIRED.issubset(cols):
+        raise ValueError('The raw-data feed has no Ticket No / Product Name / TOTAL PO VALUE columns.')
+    parsed, skipped = _records(cols, (payload or {}).get('rows') or [], source_name)
+    return _upsert(parsed, skipped)
+
+
+# ---------------------------------------------------------------------------
+# Sync from the raw-data dashboard (rawdata.systimus.in)
+# ---------------------------------------------------------------------------
+# The dashboard republishes work_orders.json each time a new HP export is added
+# there, so the board picks the data up on its own instead of needing an upload.
+SYNC_EVERY = datetime.timedelta(minutes=30)
+_SYNC_TIMEOUT = 45
+
+
+def raw_data_url():
+    return os.environ.get('RAW_DATA_URL', 'https://rawdata.systimus.in/work_orders.json').strip()
+
+
+def sync_from_dashboard(force=False):
+    """Pull work_orders.json if it changed since the last sync. Returns a summary.
+
+    Uses the response ETag, so an unchanged file costs one small request. Only
+    one caller at a time does the work (claimed atomically in the database, so
+    the gunicorn workers never run it twice); the rest return straight away."""
+    import requests
+
+    url = raw_data_url()
+    if not url:
+        return {'ok': False, 'error': 'RAW_DATA_URL is empty'}
+    FlexRawSync.objects.get_or_create(pk=1)
+    now = timezone.now()
+    claim = FlexRawSync.objects.filter(pk=1)
+    if not force:
+        claim = claim.filter(Q(checked_at__isnull=True) | Q(checked_at__lt=now - SYNC_EVERY))
+    # A crashed sync must not block forever: a claim older than 10 min is stale.
+    claim = claim.filter(Q(running_since__isnull=True) | Q(running_since__lt=now - datetime.timedelta(minutes=10)))
+    if not claim.update(checked_at=now, running_since=now):
+        return {'ok': True, 'busy': True}
+
+    state = FlexRawSync.objects.get(pk=1)
+    try:
+        headers = {} if force or not state.etag else {'If-None-Match': state.etag}
+        resp = requests.get(url, headers=headers, timeout=_SYNC_TIMEOUT)
+        if resp.status_code == 304:
+            FlexRawSync.objects.filter(pk=1).update(running_since=None, last_error='')
+            return {'ok': True, 'unchanged': True}
+        if resp.status_code != 200:
+            raise ValueError(f'{url} answered HTTP {resp.status_code}')
+        payload = resp.json()
+        generated = str(payload.get('generated') or '')[:64]
+        result = import_table(payload, 'rawdata.systimus.in' + (f' ({generated})' if generated else ''))
+        FlexRawSync.objects.filter(pk=1).update(
+            running_since=None, synced_at=timezone.now(), etag=resp.headers.get('ETag', '')[:200],
+            generated=generated, last_error='',
+            last_result=f"{result['created']} new, {result['updated']} updated, {result['unchanged']} unchanged",
+        )
+        return {'ok': True, **result}
+    except Exception as e:
+        FlexRawSync.objects.filter(pk=1).update(running_since=None, last_error=str(e)[:500])
+        return {'ok': False, 'error': str(e)}
+
+
+def sync_in_background():
+    """Fire-and-forget sync for a page load: never slows or breaks the board."""
+    state = FlexRawSync.objects.filter(pk=1).values('checked_at', 'running_since').first()
+    now = timezone.now()
+    if state and (state['running_since'] or (state['checked_at'] and now - state['checked_at'] < SYNC_EVERY)):
+        return
+
+    def run():
+        from django.db import connection
+        try:
+            sync_from_dashboard()
+        except Exception:
+            pass
+        finally:
+            connection.close()
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _sync_status():
+    st = FlexRawSync.objects.filter(pk=1).first()
+    if not st:
+        return {'synced_at': None, 'checked_at': None, 'generated': '', 'sync_error': '', 'sync_result': ''}
+    return {
+        'synced_at': st.synced_at.isoformat() if st.synced_at else None,
+        'checked_at': st.checked_at.isoformat() if st.checked_at else None,
+        'generated': st.generated,
+        'sync_error': st.last_error,
+        'sync_result': st.last_result,
     }
 
 
@@ -192,6 +298,8 @@ def status():
         'closed_from': first.isoformat() if first else None,
         'closed_to': agg['closed_to'].isoformat() if agg['closed_to'] else None,
         'last_import': agg['last_import'].isoformat() if agg['last_import'] else None,
+        'source_url': raw_data_url(),
+        **_sync_status(),
     }
 
 

@@ -3207,6 +3207,12 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         raw_ok, raw_message, raw_by_eng, regions, raw_totals = True, '', {}, [], {}
         try:
             from . import raw_rates
+            # Keep the raw data in step with rawdata.systimus.in. Runs at most every
+            # 30 minutes, in the background, so the board is never held up by it.
+            try:
+                raw_rates.sync_in_background()
+            except Exception:
+                pass
             calls = opencall_client.get_closed_call_details(first.isoformat(), last.isoformat())['calls'] if live_ok else []
             raw_rates.price_calls(calls)
             grouped = {}
@@ -3462,10 +3468,26 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             end = start - timedelta(days=1)
         return Response({'ok': ok, 'message': message, 'cycles': cycles})
 
+    @action(detail=False, methods=['post'], url_path='raw-data/sync')
+    def raw_data_sync(self, request):
+        """Admin: pull the raw data from rawdata.systimus.in now, even if it was
+        checked a moment ago."""
+        from . import raw_rates
+        if not is_admin_user(request.user):
+            return Response({'detail': 'Only administrators can sync raw data.'}, status=status.HTTP_403_FORBIDDEN)
+        result = raw_rates.sync_from_dashboard(force=True)
+        if result.get('busy'):
+            return Response({'detail': 'A sync is already running — try again in a minute.'}, status=status.HTTP_409_CONFLICT)
+        if not result.get('ok'):
+            return Response({'detail': f"Could not sync from the raw-data site: {result.get('error')}"},
+                            status=status.HTTP_502_BAD_GATEWAY)
+        return Response({**result, 'status': raw_rates.status()})
+
     @action(detail=False, methods=['get', 'post'], url_path='raw-data')
     def raw_data(self, request):
         """GET: what raw data is loaded. POST (admin, multipart ``file``): load a
-        Flex raw export. Exports are cumulative, so the newest one is enough."""
+        Flex raw export by hand — a fallback; it normally syncs from
+        rawdata.systimus.in on its own."""
         from . import raw_rates
         if request.method == 'POST':
             if not is_admin_user(request.user):

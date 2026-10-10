@@ -192,6 +192,30 @@ def get_salaries():
     return {'by_email': by_email, 'by_name': by_name}
 
 
+def get_working_days(date_from, date_to):
+    """Attendance-based day counts from Payroll for an inclusive date range.
+
+    Returns ``{'working_days': int, 'by_email': {email_lower: present_days}}``.
+    ``working_days`` is the range less Sundays; ``present_days`` counts the days
+    the person was Present / Late / Overtime. Matched by email only, like salary.
+    Raises PayrollError on failure, including a Payroll that predates the endpoint.
+    """
+    if not is_configured():
+        raise PayrollError(
+            "Payroll credentials are not set. Configure PAYROLL_USERNAME and "
+            "PAYROLL_PASSWORD (an admin/superadmin account)."
+        )
+    payload = _get(f"/api/attendance/working_days/?start_date={date_from}&end_date={date_to}") or {}
+    by_email = {}
+    for row in payload.get('results') or []:
+        if not isinstance(row, dict):
+            continue
+        email = str(row.get('email') or '').strip().lower()
+        if email:
+            by_email[email] = int(row.get('present_days') or 0)
+    return {'working_days': int(payload.get('working_days') or 0), 'by_email': by_email}
+
+
 def get_employees(fresh=False):
     """Every Payroll employee as ``{'name', 'email', 'salary'}``, name and email
     kept together. Cached for a few minutes; pass ``fresh=True`` to bypass that.

@@ -1121,7 +1121,7 @@ class EngineerPnl(models.Model):
             return Decimal('0.00')
         return (self.engg_salary / self.total_working_days).quantize(Decimal('0.01'))
 
-    def compute(self, closed_calls, period_days=None, cycle_days=None):
+    def compute(self, closed_calls, period_days=None, cycle_days=None, actual_working_days=None, raw=None):
         """Live P&L figures for the window being viewed.
 
         Engg Earning = calls closed IN THE WINDOW x per-call-rate.
@@ -1148,16 +1148,33 @@ class EngineerPnl(models.Model):
         # Fall back to the configured working month only when the caller cannot say
         # how long the cycle was, so this stays correct if called from elsewhere.
         cycle = max(int(cycle_days or self.total_working_days or 30), 1)
-        awd = self.actual_working_days or 0
+        # Days actually worked in the window, from Payroll attendance when the
+        # board could get it; the configured figure only as a fallback.
+        awd = self.actual_working_days if actual_working_days is None else actual_working_days
+        awd = awd or 0
         actual_closed_pd = (closed / awd).quantize(Decimal('0.01')) if awd else Decimal('0.00')
         engg_earning = (closed * self.per_call_rate).quantize(Decimal('0.01'))
         one_day_salary = self.per_day
         daily_rate = (self.engg_salary / cycle).quantize(Decimal('0.01'))
         window_salary = (self.engg_salary * days / cycle).quantize(Decimal('0.01'))
         profit_loss = (engg_earning - window_salary).quantize(Decimal('0.01'))
+        # The same window priced at what HP pays per call (raw_rates), shown next
+        # to the flat per-call rate rather than replacing it.
+        raw = raw or {}
+        raw_earning = Decimal(str(raw.get('value') or 0)).quantize(Decimal('0.01'))
+        raw_calls = int(raw.get('calls') or 0)
+        raw_rate = (raw_earning / raw_calls).quantize(Decimal('0.01')) if raw_calls else Decimal('0.00')
+        raw_profit_loss = (raw_earning - window_salary).quantize(Decimal('0.01'))
         return {
             'closed_calls': int(closed),
             'actual_closed_pd': str(actual_closed_pd),
+            'actual_working_days_used': awd,
+            'raw_rate': str(raw_rate),
+            'raw_earning': str(raw_earning),
+            'raw_profit_loss': str(raw_profit_loss),
+            'raw_actual_calls': int(raw.get('actual') or 0),
+            'raw_rejected_calls': int(raw.get('rejected') or 0),
+            'raw_estimated_calls': int(raw.get('estimated') or 0),
             'total_calls_closed_pm': int(closed),
             'per_day': str(one_day_salary),
             'period_days': days,
@@ -1173,6 +1190,36 @@ class EngineerPnl(models.Model):
             'profit_loss': str(profit_loss),
             'nett': str(profit_loss),                    # alias (Profit/Loss)
         }
+
+
+class FlexRawRecord(models.Model):
+    """One work order from HP's Flex raw export, the record of what HP paid.
+
+    Each export is cumulative (every call since 25 Jun 2025), so an import
+    upserts on Ticket No and the latest file always wins. The Engineer P&L uses
+    these two ways: a closed call found here is priced at what HP actually paid
+    for it, and one not found yet (anything newer than the last export) is
+    priced at what comparable calls were paid — see ``raw_rates``."""
+    ticket_no = models.CharField(max_length=120, unique=True)
+    case_id = models.CharField(max_length=40, blank=True, default='', db_index=True)
+    product_name = models.CharField(max_length=300, blank=True, default='')
+    wo_otc_code = models.CharField(max_length=120, blank=True, default='')
+    business_segment = models.CharField(max_length=60, blank=True, default='')
+    call_classification = models.CharField(max_length=40, blank=True, default='')
+    # ASP code, e.g. ASPS01461 (Chennai). Blank on some rows in the export.
+    work_location = models.CharField(max_length=40, blank=True, default='')
+    asp_city = models.CharField(max_length=80, blank=True, default='')
+    closed_on = models.DateField(null=True, blank=True, db_index=True)
+    po_value = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    po_remark = models.CharField(max_length=120, blank=True, default='')
+    source_file = models.CharField(max_length=255, blank=True, default='')
+    imported_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-closed_on', 'ticket_no']
+
+    def __str__(self):
+        return f"{self.ticket_no} {self.product_name[:30]}"
 
 
 class SleekBillInvoice(models.Model):

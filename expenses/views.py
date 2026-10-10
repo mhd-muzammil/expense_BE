@@ -3178,6 +3178,20 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             payroll_ok = False
             payroll_message = f'Could not reach Payroll: {e}'
 
+        # Real working days from Payroll attendance, matched by email like salary.
+        # Total WD = the window less Sundays; Actual WD = days the person was
+        # present. Anyone without a match keeps their configured figures.
+        wd_ok, wd_message, wd_total, wd_by_email = None, '', None, {}
+        try:
+            from . import payroll_client
+            if payroll_client.is_configured():
+                wd = payroll_client.get_working_days(first.isoformat(), last.isoformat())
+                wd_total, wd_by_email, wd_ok = wd['working_days'], wd['by_email'], True
+            else:
+                wd_ok = False
+        except Exception as e:
+            wd_ok, wd_message = False, f'Could not read working days from Payroll: {e}'
+
         # Live pull of closed-call counts (name-keyed, case-insensitive).
         live_ok, message, counts, display, meta = True, '', {}, {}, {}
         try:
@@ -3188,11 +3202,31 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         except Exception as e:  # network/timeout etc. — never break the page
             live_ok, message = False, f'Could not reach OpenCall: {e}'
 
+        # Price every closed call in the window from HP's raw data, then total it
+        # per engineer (for the Raw Data Rate column) and per region (price card).
+        raw_ok, raw_message, raw_by_eng, regions, raw_totals = True, '', {}, [], {}
+        try:
+            from . import raw_rates
+            calls = opencall_client.get_closed_call_details(first.isoformat(), last.isoformat())['calls'] if live_ok else []
+            raw_rates.price_calls(calls)
+            grouped = {}
+            for c in calls:
+                grouped.setdefault((c.get('engineer_name') or '').strip().lower(), []).append(c)
+            raw_by_eng = {k: raw_rates.summarize(v) for k, v in grouped.items()}
+            regions = raw_rates.by_region(calls)
+            raw_totals = raw_rates.summarize(calls)
+        except Exception as e:
+            raw_ok, raw_message = False, f'Could not price calls from raw data: {e}'
+
         configured_keys = {e.engineer_name.strip().lower() for e in engineers}
         all_rows = []
         for eng in engineers:
-            closed = int(counts.get(eng.engineer_name.strip().lower(), 0))
-            calc = eng.compute(closed, period_days, cycle_days)
+            key = eng.engineer_name.strip().lower()
+            closed = int(counts.get(key, 0))
+            email_key = (eng.email or '').strip().lower()
+            present = wd_by_email.get(email_key) if email_key else None
+            calc = eng.compute(closed, period_days, cycle_days,
+                               actual_working_days=present, raw=raw_by_eng.get(key))
             all_rows.append({
                 'id': eng.id,
                 'engineer_name': eng.engineer_name,
@@ -3201,8 +3235,13 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 'per_day_target': eng.per_day_target,
                 'per_call_rate': str(eng.per_call_rate),
                 'engg_salary': str(eng.engg_salary),
-                'total_working_days': eng.total_working_days,
-                'actual_working_days': eng.actual_working_days,
+                'total_working_days': wd_total if present is not None else eng.total_working_days,
+                'actual_working_days': present if present is not None else eng.actual_working_days,
+                'working_days_source': 'payroll' if present is not None else 'manual',
+                # The engineer's own configured figures, for the edit form — saving
+                # the form must not turn this window's attendance into a setting.
+                'manual_total_working_days': eng.total_working_days,
+                'manual_actual_working_days': eng.actual_working_days,
                 'salary_source': salary_source.get(eng.id, 'manual'),
                 **calc,
             })
@@ -3259,8 +3298,19 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
                 'total_engg_salary': str(tot_sal),
                 'nett': str(tot_nett),
                 'window_salary': str(sum((Decimal(r['window_salary']) for r in rows), Decimal('0.00'))),
+                'raw_revenue': str(sum((Decimal(r['raw_earning']) for r in rows), Decimal('0.00'))),
+                'raw_nett': str(sum((Decimal(r['raw_profit_loss']) for r in rows), Decimal('0.00'))),
             },
             'unmatched_engineers': unmatched,
+            'working_days_ok': wd_ok,
+            'working_days_message': wd_message,
+            'working_days_total': wd_total,
+            'raw_ok': raw_ok,
+            'raw_message': raw_message,
+            'raw_status': raw_rates.status() if raw_ok else None,
+            # Every closed call in the window, all engineers, by region.
+            'regions': regions,
+            'region_totals': {k: (str(v) if isinstance(v, Decimal) else v) for k, v in raw_totals.items()},
         })
 
     @action(detail=False, methods=['get'], url_path='payroll-employees')
@@ -3345,6 +3395,15 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             live_ok = False
             message = str(e) if e.__class__.__name__ == 'OpenCallError' else f'Could not reach OpenCall: {e}'
 
+        # What HP paid (or would pay) for each call — best-effort, like the rest.
+        try:
+            from . import raw_rates
+            raw_rates.price_calls(calls)
+            for c in calls:
+                c['raw_value'] = str(c['raw_value'])
+        except Exception:
+            pass
+
         return Response({
             'period': {'from': first.isoformat(), 'to': last.isoformat()},
             'engineer': engineer or '',
@@ -3354,6 +3413,74 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             'count': len(calls),
             'calls': calls,
         })
+
+    @action(detail=False, methods=['get'], url_path='region-history')
+    def region_history(self, request):
+        """Raw-data value per region for each of the last ``cycles`` salary
+        cycles (25th to 24th), newest first, including the one in progress.
+
+        A finished cycle does not change, so each is cached for 15 minutes; the
+        current one is always fetched fresh."""
+        from datetime import date
+        from django.core.cache import cache
+        from . import opencall_client, raw_rates
+
+        try:
+            n = max(1, min(int(request.query_params.get('cycles', 6)), 15))
+        except ValueError:
+            n = 6
+        today = date.today()
+        # End of the cycle in progress.
+        end = today.replace(day=24) if today.day < 25 else (today.replace(day=1) + timedelta(days=32)).replace(day=24)
+        card = raw_rates.rate_card()
+        cycles, ok, message = [], True, ''
+        for _ in range(n):
+            start = (end.replace(day=1) - timedelta(days=1)).replace(day=25)
+            current = start <= today <= end
+            key = f'engpnl-region-{start.isoformat()}-{end.isoformat()}-{card.size}'
+            entry = None if current else cache.get(key)
+            if entry is None:
+                try:
+                    calls = opencall_client.get_closed_call_details(start.isoformat(), min(end, today).isoformat())['calls']
+                except Exception as e:
+                    ok = False
+                    message = str(e) if e.__class__.__name__ == 'OpenCallError' else f'Could not reach OpenCall: {e}'
+                    break
+                raw_rates.price_calls(calls, card)
+                total = raw_rates.summarize(calls)
+                entry = {
+                    'label': end.strftime('%b %Y'),
+                    'from': start.isoformat(),
+                    'to': end.isoformat(),
+                    'current': current,
+                    'regions': raw_rates.by_region(calls),
+                    'total': {k: (str(v) if isinstance(v, Decimal) else v) for k, v in total.items()},
+                }
+                if not current:
+                    cache.set(key, entry, 15 * 60)
+            cycles.append(entry)
+            end = start - timedelta(days=1)
+        return Response({'ok': ok, 'message': message, 'cycles': cycles})
+
+    @action(detail=False, methods=['get', 'post'], url_path='raw-data')
+    def raw_data(self, request):
+        """GET: what raw data is loaded. POST (admin, multipart ``file``): load a
+        Flex raw export. Exports are cumulative, so the newest one is enough."""
+        from . import raw_rates
+        if request.method == 'POST':
+            if not is_admin_user(request.user):
+                return Response({'detail': 'Only administrators can upload raw data.'}, status=status.HTTP_403_FORBIDDEN)
+            f = request.FILES.get('file')
+            if not f:
+                return Response({'detail': 'Choose the Flex raw export (.xlsx) to upload.'}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                result = raw_rates.import_workbook(f, f.name)
+            except ValueError as e:
+                return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                return Response({'detail': f'Could not read that workbook: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({**result, 'status': raw_rates.status()})
+        return Response(raw_rates.status())
 
 
 # ---------------------------------------------------------------------------

@@ -157,7 +157,7 @@ class BoardTests(TestCase):
         EngineerPnl.objects.create(engineer_name='Praveen', email='praveen@x.in', engg_salary=Decimal('31000'))
         EngineerPnl.objects.create(engineer_name='Jeeva', email='', engg_salary=Decimal('31000'))
 
-    def _board(self, working_days=None):
+    def _board(self, working_days=None, rng=('2026-08-25', '2026-09-24')):
         calls = [
             {'engineer_name': 'Praveen', 'ticket_id': 'WO-1', 'work_location': 'ASPS01465'},
             {'engineer_name': 'Praveen', 'ticket_id': 'WO-NEW', 'product_name': TANK,
@@ -174,9 +174,29 @@ class BoardTests(TestCase):
              mock.patch('expenses.payroll_client.get_employees', return_value=[]), \
              mock.patch('expenses.payroll_client.get_working_days', **(
                  {'return_value': working_days} if working_days else {'side_effect': Exception('404')})):
-            res = self.client.get('/api/engineer-pnl/board/', {'from': '2026-08-25', 'to': '2026-09-24', 'sync': '0'})
+            res = self.client.get('/api/engineer-pnl/board/', {'from': rng[0], 'to': rng[1], 'sync': '0'})
         self.assertEqual(res.status_code, 200, res.content)
         return res.data
+
+    def test_salary_is_docked_for_missed_working_days(self):
+        # 25 Aug - 24 Sep 2026: 31 days, 27 working. Praveen was present 24, so
+        # 3 working days are cut: paid for 28 of 31 days. Sundays stay paid.
+        data = self._board({'working_days': 27, 'by_email': {'praveen@x.in': 24}})
+        rows = {r['engineer_name']: r for r in data['rows']}
+        p = rows['Praveen']
+        self.assertEqual((p['paid_days'], p['absent_days']), (28, 3))
+        self.assertEqual(p['window_salary'], '28000.00')        # 31000 / 31 x 28
+        self.assertEqual(p['nett'], str(Decimal(p['engg_earning']) - Decimal('28000.00')))
+        # Not linked to Payroll: no attendance, so the whole window is charged.
+        self.assertEqual((rows['Jeeva']['paid_days'], rows['Jeeva']['window_salary']), (31, '31000.00'))
+
+    def test_days_not_yet_over_are_never_docked(self):
+        from datetime import date as _date, timedelta as _td
+        start = _date.today() + _td(days=1)
+        data = self._board({'working_days': 6, 'by_email': {'praveen@x.in': 0}},
+                           rng=(start.isoformat(), (start + _td(days=6)).isoformat()))
+        p = {r['engineer_name']: r for r in data['rows']}['Praveen']
+        self.assertEqual((p['paid_days'], p['absent_days']), (7, 0))
 
     def test_working_days_from_payroll(self):
         data = self._board({'working_days': 27, 'by_email': {'praveen@x.in': 20}})

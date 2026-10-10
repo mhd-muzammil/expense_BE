@@ -3181,12 +3181,25 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
         # Real working days from Payroll attendance, matched by email like salary.
         # Total WD = the window less Sundays; Actual WD = days the person was
         # present. Anyone without a match keeps their configured figures.
+        #
+        # Salary is then charged for the days actually paid: every day of the
+        # window (Sundays are paid holidays) less the working days the engineer
+        # missed. Only days that are over count as missed — through yesterday —
+        # so today and the rest of a running cycle are never docked before the
+        # attendance for them can exist.
         wd_ok, wd_message, wd_total, wd_by_email = None, '', None, {}
+        past_present, past_wd = {}, 0
+        att_end = min(last, date.today() - timedelta(days=1))
         try:
             from . import payroll_client
             if payroll_client.is_configured():
                 wd = payroll_client.get_working_days(first.isoformat(), last.isoformat())
                 wd_total, wd_by_email, wd_ok = wd['working_days'], wd['by_email'], True
+                if att_end >= first:
+                    past = wd if att_end == last else payroll_client.get_working_days(first.isoformat(), att_end.isoformat())
+                    past_present = past['by_email']
+                    past_wd = sum(1 for i in range((att_end - first).days + 1)
+                                  if (first + timedelta(days=i)).weekday() != 6)
             else:
                 wd_ok = False
         except Exception as e:
@@ -3231,8 +3244,12 @@ class EngineerPnlViewSet(viewsets.ModelViewSet):
             closed = int(counts.get(key, 0))
             email_key = (eng.email or '').strip().lower()
             present = wd_by_email.get(email_key) if email_key else None
-            calc = eng.compute(closed, period_days, cycle_days,
-                               actual_working_days=present, raw=raw_by_eng.get(key))
+            paid_days = None
+            if present is not None:
+                absent = max(0, past_wd - past_present.get(email_key, 0))
+                paid_days = period_days - absent
+            calc = eng.compute(closed, period_days, cycle_days, actual_working_days=present,
+                               raw=raw_by_eng.get(key), paid_days=paid_days)
             all_rows.append({
                 'id': eng.id,
                 'engineer_name': eng.engineer_name,

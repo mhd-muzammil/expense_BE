@@ -91,6 +91,26 @@ class RawRateTests(TestCase):
         regions = {r['region']: r['value'] for r in raw_rates.by_region(calls)}
         self.assertEqual(regions, {'SALEM': '400.00', 'CHENNAI': '350.00', 'HOSUR': '300.00'})
 
+    def test_calls_carry_what_hp_says_about_them(self):
+        rejected, by_case, new = raw_rates.price_calls([
+            {'ticket_id': 'WO-4'},
+            {'ticket_id': 'X', 'case_id': 'C6'},
+            {'ticket_id': 'NOT-IN-RAW', 'product_name': TANK, 'wo_otc_code': INSTALL},
+        ])
+        self.assertEqual(rejected['raw_source'], 'rejected')
+        self.assertEqual(rejected['hp'], {
+            'ticket_no': 'WO-4', 'remark': 'REJECTED', 'call_type': 'INSTALL', 'segment': 'Printing',
+            'po_value': '0.00', 'closed_on': '2025-08-31',
+        })
+        self.assertEqual((by_case['hp']['ticket_no'], by_case['hp']['po_value']), ('WO-6', '800.00'))
+        self.assertIsNone(new['hp'])
+
+    def test_a_stray_number_is_not_a_call_type(self):
+        row = _raw('WO-9', 300)
+        row[8] = '46206.77'
+        raw_rates.import_workbook(_workbook([row]), 'odd.xlsx')
+        self.assertEqual(raw_rates.price_calls([{'ticket_id': 'WO-9'}])[0]['hp']['call_type'], '')
+
 
 class DashboardSyncTests(TestCase):
     """The raw data follows rawdata.systimus.in's work_orders.json on its own."""

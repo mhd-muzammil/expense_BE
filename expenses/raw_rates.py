@@ -393,12 +393,17 @@ class RateCard:
         rate, basis = self.fallback
         return rate, f'new product; all calls, {basis}'
 
-    def price(self, call):
-        """``(value, source, basis)`` for one OpenCall closed call."""
+    def record(self, call):
+        """The HP raw-data row for one OpenCall closed call: by ticket, else by case."""
         rec = self.by_ticket.get(str(call.get('ticket_id') or '').strip().upper())
         if rec is None:
             case = str(call.get('case_id') or '').strip()
             rec = self.by_case.get(case) if case else None
+        return rec
+
+    def price(self, call):
+        """``(value, source, basis)`` for one OpenCall closed call."""
+        rec = self.record(call)
         if rec is not None:
             remark = rec['po_remark']
             if remark.startswith(_PAID) and rec['po_value'] > 0:
@@ -419,17 +424,37 @@ def rate_card():
         if _cache['key'] != key:
             rows = FlexRawRecord.objects.values(
                 'ticket_no', 'case_id', 'product_name', 'wo_otc_code', 'po_value', 'po_remark', 'closed_on',
+                'call_classification', 'business_segment',
             )
             _cache['card'] = RateCard(rows)
             _cache['key'] = key
         return _cache['card']
 
 
+def hp_details(rec):
+    """What HP's raw data says about a call, for showing why it is paid, pending
+    or rejected; None when the call is not in the raw data yet."""
+    if rec is None:
+        return None
+    kind = (rec.get('call_classification') or '').strip()
+    return {
+        'ticket_no': rec['ticket_no'],
+        'remark': rec['po_remark'],
+        # Some export rows carry a stray Excel number here instead of BREAKFIX/INSTALL.
+        'call_type': kind if kind.isalpha() else '',
+        'segment': rec.get('business_segment') or '',
+        'po_value': str(rec['po_value']),
+        'closed_on': rec['closed_on'].isoformat() if rec.get('closed_on') else None,
+    }
+
+
 def price_calls(calls, card=None):
-    """Annotate each call dict in place with raw_value / raw_source / raw_basis / region."""
+    """Annotate each call dict in place with raw_value / raw_source / raw_basis / region,
+    and hp: the raw-data row behind it (see ``hp_details``)."""
     card = card or rate_card()
     for c in calls:
         value, source, basis = card.price(c)
+        c['hp'] = hp_details(card.record(c))
         c['raw_value'] = value
         c['raw_source'] = source
         c['raw_basis'] = basis

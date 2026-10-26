@@ -22,6 +22,8 @@ class ExpenseSerializer(serializers.ModelSerializer):
     statement_status = serializers.SerializerMethodField()
     # The bank-statement row this entry reconciled to (null when not matched).
     matched_statement = serializers.SerializerMethodField()
+    # How many identical entries (this one included) exist; null when unique.
+    duplicate_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Expense
@@ -29,8 +31,11 @@ class ExpenseSerializer(serializers.ModelSerializer):
             'id', 'date', 'category', 'branch', 'branch_location',
             'credited_amount', 'credit_remark', 'credit_person', 'credit_payment_mode',
             'debited_amount', 'debit_remark', 'debit_person', 'debit_payment_mode',
-            'running_balances', 'statement_status', 'matched_statement', 'created_at',
+            'running_balances', 'statement_status', 'matched_statement', 'duplicate_count', 'created_at',
         ]
+
+    def get_duplicate_count(self, obj):
+        return getattr(obj, 'duplicate_count', None)
 
     def get_statement_status(self, obj):
         return getattr(obj, 'statement_status', None)

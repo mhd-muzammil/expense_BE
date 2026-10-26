@@ -174,6 +174,22 @@ def _apply_mode_filter(qs, mode):
     return qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
 
 
+def _duplicate_group_sizes():
+    """``{expense_id: n}`` for every entry that has identical twins — same date,
+    branch, category, amounts and payment modes (case-insensitive, as in
+    ExpenseCreateSerializer.validate) — where n is the size of its group."""
+    groups = {}
+    rows = Expense.objects.values_list(
+        'id', 'date', 'branch_id', 'category', 'credited_amount', 'debited_amount',
+        'credit_payment_mode', 'debit_payment_mode',
+    )
+    for eid, d, branch, cat, credit, debit, cmode, dmode in rows:
+        key = (d, branch, (cat or '').lower(), credit, debit,
+               (cmode or '').lower(), (dmode or '').lower())
+        groups.setdefault(key, []).append(eid)
+    return {eid: len(ids) for ids in groups.values() if len(ids) > 1 for eid in ids}
+
+
 class ExpenseViewSet(viewsets.ModelViewSet):
     """CRUD for expenses with filtering and running balance."""
 
@@ -275,6 +291,17 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 expense.statement_status = None
                 expense.matched_statement = None
 
+        # Possible duplicates: entries identical to another one (the rule the
+        # create-time guard uses). Counted over the whole ledger, so a twin
+        # outside the current filter still flags the entry.
+        dup_sizes = _duplicate_group_sizes()
+        for expense in expenses:
+            expense.duplicate_count = dup_sizes.get(expense.id)
+        duplicate_total = sum(1 for e in expenses if e.duplicate_count)
+        if self.request.query_params.get('duplicates') in ('1', 'true'):
+            # Filter after the running balances so those stay correct.
+            expenses = [e for e in expenses if e.duplicate_count]
+
         # To show newest first, reverse the list AFTER calculating running balances,
         # then paginate. This keeps correct balance cache on each object.
         expenses.reverse()
@@ -287,10 +314,12 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             # Reconciliation totals across the FULL filtered set (not just this page),
             # so the Expenses section can show a "Matched with Statement" strip.
             resp.data['statement_summary'] = stmt_summary
+            resp.data['duplicate_total'] = duplicate_total
             return resp
 
         serializer = self.get_serializer(expenses, many=True)
-        return Response({'results': serializer.data, 'statement_summary': stmt_summary})
+        return Response({'results': serializer.data, 'statement_summary': stmt_summary,
+                         'duplicate_total': duplicate_total})
 
     @action(detail=False, methods=['delete'], url_path='delete-all')
     def delete_all(self, request):

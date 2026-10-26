@@ -37,3 +37,19 @@ class ExpenseDuplicateTests(TestCase):
 
         res = self.client.put(f"/api/expenses/{first['id']}/", ENTRY, format='json')
         self.assertEqual(res.status_code, 200)
+
+    def test_list_flags_existing_duplicates(self):
+        self.client.post('/api/expenses/', ENTRY, format='json')
+        self.client.post('/api/expenses/', {**ENTRY, 'allow_duplicate': True}, format='json')
+        # Same transaction typed with different casing still counts.
+        self.client.post('/api/expenses/', {**ENTRY, 'category': 'SALARY ADVANCE', 'allow_duplicate': True}, format='json')
+        self.client.post('/api/expenses/', {**ENTRY, 'debited_amount': 150}, format='json')
+
+        res = self.client.get('/api/expenses/')
+        self.assertEqual(res.data['duplicate_total'], 3)
+        counts = sorted(r['duplicate_count'] or 0 for r in res.data['results'])
+        self.assertEqual(counts, [0, 3, 3, 3])
+
+        res = self.client.get('/api/expenses/?duplicates=1')
+        self.assertEqual(len(res.data['results']), 3)
+        self.assertEqual(res.data['duplicate_total'], 3)

@@ -1,4 +1,5 @@
 from decimal import Decimal
+from django.utils import timezone
 from rest_framework import serializers
 from .models import Branch, Expense, PaymentModeBalance, BillingReminder, PettyCashDebit, Invoice, InvoiceItem, DeliveryChallan, DeliveryChallanItem, PurchaseBill, PurchaseBillItem, PurchaseOrder, PurchaseOrderItem, PaymentReceipt, PaymentReceiptLine, Quote, QuoteItem, BillOfSupply, BillOfSupplyItem, TaxInvoice, TaxInvoiceItem, BankStatementEntry, EngineerPnl, SleekBillInvoice, Subscription
 
@@ -130,6 +131,33 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
                 #     raise serializers.ValidationError(
                 #         f"Insufficient funds! You have only \u20b9{current_balance:,.2f} balance in {mode}."
                 #     )
+
+        # Two people share this ledger, so the same transaction can get entered
+        # twice (one of them working from a stale screen). On create, refuse an
+        # entry identical to an existing one unless the client confirms with
+        # allow_duplicate \u2014 genuine repeats (two equal transfers a day) still go in.
+        allow_dup = str(self.initial_data.get('allow_duplicate', '')).lower() in ('1', 'true', 'yes')
+        if not self.instance and not allow_dup:
+            existing = Expense.objects.filter(
+                date=data.get('date'),
+                branch=data.get('branch'),
+                category__iexact=data.get('category') or '',
+                credited_amount=credit or None,
+                debited_amount=debit or None,
+                credit_payment_mode__iexact=data.get('credit_payment_mode') or '',
+                debit_payment_mode__iexact=data.get('debit_payment_mode') or '',
+            ).first()
+            if existing:
+                amount = debit or credit
+                person = existing.debit_person or existing.credit_person
+                raise serializers.ValidationError({
+                    'duplicate': [
+                        f"An identical entry already exists: {existing.date:%d %b %Y}, "
+                        f"{existing.category}, \u20b9{amount:,.2f}"
+                        + (f" to/from {person}" if person else '')
+                        + f" (entered {timezone.localtime(existing.created_at):%d %b %Y %I:%M %p})."
+                    ],
+                })
 
         return data
 

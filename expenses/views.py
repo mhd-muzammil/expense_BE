@@ -2061,6 +2061,9 @@ def import_expenses(request):
     for row_idx, data in import_data:
         # Strip out extra keys that aren't in the serializer
         clean_data = {k: v for k, v in data.items() if k in valid_fields}
+        # A sheet can legitimately hold identical rows; the duplicate guard is
+        # for hand entry only.
+        clean_data['allow_duplicate'] = True
         print(f"[IMPORT DEBUG] Row {row_idx} clean_data: {clean_data}")
         serializer = ExpenseCreateSerializer(data=clean_data)
         if serializer.is_valid():

@@ -3031,7 +3031,13 @@ class _BankStatementViewSet(viewsets.ModelViewSet):
         details of that entry (or null) so the UI can show it on demand."""
         qs = self.filter_queryset(self.get_queryset())
         entries = list(qs)
-        match_map, suggested_mode = _bank_match_map(self.bank, entries)
+        # Match against the whole statement, not just the filtered rows: a
+        # reference pairs across dates, so an entry whose reference is outside
+        # the date range must not fall back onto a row inside it.
+        match_map, suggested_mode = _bank_match_map(
+            self.bank, list(BankStatementEntry.objects.filter(bank=self.bank)))
+        shown = {e.id for e in entries}
+        match_map = {k: v for k, v in match_map.items() if k in shown}
         data = self.get_serializer(entries, many=True).data
         for row in data:
             m = match_map.get(row['id'])

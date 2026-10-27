@@ -1,4 +1,5 @@
 import csv
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
@@ -2776,14 +2777,35 @@ _BANK_MODE_HINTS = {
 }
 
 
+# A transaction reference inside a narration or remark: 9+ digits, optionally
+# behind a bank code — "628500733605" (IMPS/UPI), "1529973425" (EBANK),
+# "BARBT26118913199" (NEFT). Masked accounts ("XXXXXXXXXX1929"), UPI handles
+# ("7200407008@ybl") and times are not references.
+_BANK_REF_RE = re.compile(r'^[A-Za-z]{0,6}\d{9,}$')
+
+
+def _bank_refs(text):
+    """Set of transaction references found in a narration / remark."""
+    return {t.upper() for t in re.split(r'[/\s:\-]+', text or '') if _BANK_REF_RE.match(t)}
+
+
 def _bank_match_map(bank, entries):
     """Reconcile bank-statement `entries` against the Expenses ledger.
 
-    A bank row counts as "matched" when the Expenses section holds an entry with
-    the SAME date, SAME amount, on the SAME side (a bank debit ↔ an expense
-    debit; a bank credit ↔ an expense credit) AND under a payment mode that
-    belongs to this bank. Matching is one-to-one: each expense can satisfy only
-    one bank row, so duplicate amounts on a day are reconciled by count.
+    Pass 1 — by reference: a bank row matches the expense whose remark carries
+    the row's transaction reference (same side and amount, any date). Names and
+    remarks are what tell apart several equal payments on one day (e.g. seven
+    ₹8,000 salary advances), so this pairing is the right one.
+
+    Pass 2 — the remaining rows fall back to the SAME date, SAME amount, on the
+    SAME side (a bank debit ↔ an expense debit; a bank credit ↔ an expense
+    credit). An expense whose remark carries a reference of THIS statement is
+    left out of the fallback: it belongs to that row only, so a second copy of
+    it (the same bank remark entered twice) shows as unmatched instead of
+    covering some other person's payment.
+
+    Either way the expense must be under a payment mode that belongs to this
+    bank, and matching is one-to-one: each expense satisfies only one bank row.
 
     Returns ``(match_map, suggested_mode)`` where match_map is a dict
     ``{bank_entry_id: expense_detail}`` describing the matched Expenses entry (so
@@ -2818,42 +2840,74 @@ def _bank_match_map(bank, entries):
         'debit_remark', 'credit_remark', 'debit_person', 'credit_person',
     )
 
-    # Available expense "slots" keyed by (date, amount, side). Each key holds a
-    # queue of the actual matching expense details, popped as bank rows claim them.
-    slots = defaultdict(list)
+    def bank_key(be):
+        if be.debit and be.debit > 0:
+            return (be.txn_date, q2(be.debit), 'debit')
+        if be.credit and be.credit > 0:
+            return (be.txn_date, q2(be.credit), 'credit')
+        return None
+
+    # Claim in a stable order (oldest first) so the pairing is deterministic
+    # regardless of the display ordering.
+    entries = sorted(entries, key=lambda x: (x.txn_date or datetime.min.date(), x.id))
+    statement_refs = set()
+    for be in entries:
+        statement_refs |= _bank_refs(be.narration) | _bank_refs(be.ref_no)
+
+    # Expense sides that could belong to this bank, oldest first. Each carries
+    # its (date, amount, side) key and the statement references in its remark.
+    candidates = []
     mode_counter = Counter()
-    for e in exp:
+    for e in sorted(exp, key=lambda x: x['id']):
         d = e['date']
-        if e['debited_amount'] and belongs(e['debit_payment_mode']):
-            mode_counter[e['debit_payment_mode']] += 1
-            slots[(d, q2(e['debited_amount']), 'debit')].append({
-                'id': e['id'], 'date': d.isoformat() if d else None,
-                'category': e['category'], 'branch': e['branch__location'],
-                'side': 'debit', 'amount': str(e['debited_amount']),
-                'mode': e['debit_payment_mode'], 'remark': e['debit_remark'],
-                'person': e['debit_person'],
-            })
-        if e['credited_amount'] and belongs(e['credit_payment_mode']):
-            mode_counter[e['credit_payment_mode']] += 1
-            slots[(d, q2(e['credited_amount']), 'credit')].append({
-                'id': e['id'], 'date': d.isoformat() if d else None,
-                'category': e['category'], 'branch': e['branch__location'],
-                'side': 'credit', 'amount': str(e['credited_amount']),
-                'mode': e['credit_payment_mode'], 'remark': e['credit_remark'],
-                'person': e['credit_person'],
+        for side, amt, mode, remark, person in (
+            ('debit', e['debited_amount'], e['debit_payment_mode'], e['debit_remark'], e['debit_person']),
+            ('credit', e['credited_amount'], e['credit_payment_mode'], e['credit_remark'], e['credit_person']),
+        ):
+            if not amt or not belongs(mode):
+                continue
+            mode_counter[mode] += 1
+            candidates.append({
+                'key': (d, q2(amt), side),
+                'refs': _bank_refs(remark) & statement_refs,
+                'detail': {
+                    'id': e['id'], 'date': d.isoformat() if d else None,
+                    'category': e['category'], 'branch': e['branch__location'],
+                    'side': side, 'amount': str(amt),
+                    'mode': mode, 'remark': remark, 'person': person,
+                },
             })
     suggested_mode = mode_counter.most_common(1)[0][0] if mode_counter else ''
 
-    # Claim slots in a stable order (oldest first) so the pairing is deterministic
-    # regardless of the display ordering.
+    # Pass 1: by transaction reference. Each expense side holds its key and refs
+    # so a claim is checked against side and amount, not just the reference.
+    by_ref = defaultdict(list)
+    for c in candidates:
+        for r in c['refs']:
+            by_ref[r].append(c)
+    claimed = set()
     match_map = {}
-    for be in sorted(entries, key=lambda x: (x.txn_date or datetime.min.date(), x.id)):
-        key = None
-        if be.debit and be.debit > 0:
-            key = (be.txn_date, q2(be.debit), 'debit')
-        elif be.credit and be.credit > 0:
-            key = (be.txn_date, q2(be.credit), 'credit')
-        if key and slots.get(key):
+    for be in entries:
+        key = bank_key(be)
+        if not key:
+            continue
+        for r in sorted(_bank_refs(be.narration) | _bank_refs(be.ref_no)):
+            c = next((c for c in by_ref.get(r, ())
+                      if id(c) not in claimed and c['key'][1:] == key[1:]), None)
+            if c:
+                claimed.add(id(c))
+                match_map[be.id] = c['detail']
+                break
+
+    # Pass 2: date + amount + side, among expenses that name no statement
+    # reference (a copy of an already-claimed one stays unmatched).
+    slots = defaultdict(list)
+    for c in candidates:
+        if id(c) not in claimed and not c['refs']:
+            slots[c['key']].append(c['detail'])
+    for be in entries:
+        key = bank_key(be)
+        if be.id not in match_map and key and slots.get(key):
             match_map[be.id] = slots[key].pop(0)
     return match_map, suggested_mode
 

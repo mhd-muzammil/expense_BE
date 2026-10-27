@@ -175,12 +175,13 @@ def _apply_mode_filter(qs, mode):
     return qs.filter(Q(credit_payment_mode__iexact=mode) | Q(debit_payment_mode__iexact=mode))
 
 
-def _duplicate_group_sizes():
+def _duplicate_group_sizes(in_statement=()):
     """``{expense_id: n}`` for every entry that has identical twins — same date,
     branch, category, amounts, payment modes, persons and remarks
     (case-insensitive, as in ExpenseCreateSerializer.validate) — where n is the
     size of its group. Equal salary advances to different people that day are
-    not twins."""
+    not twins. A group whose entries are all in ``in_statement`` (each matched
+    to its own bank line, e.g. two ₹590 customer receipts) is not flagged."""
     groups = {}
     rows = Expense.objects.values_list(
         'id', 'date', 'branch_id', 'category', 'credited_amount', 'debited_amount',
@@ -191,7 +192,9 @@ def _duplicate_group_sizes():
         key = (d, branch, (cat or '').lower(), credit, debit,
                *((t or '').lower() for t in texts))
         groups.setdefault(key, []).append(eid)
-    return {eid: len(ids) for ids in groups.values() if len(ids) > 1 for eid in ids}
+    in_statement = set(in_statement)
+    return {eid: len(ids) for ids in groups.values()
+            if len(ids) > 1 and not in_statement.issuperset(ids) for eid in ids}
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
@@ -298,7 +301,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         # Possible duplicates: entries identical to another one (the rule the
         # create-time guard uses). Counted over the whole ledger, so a twin
         # outside the current filter still flags the entry.
-        dup_sizes = _duplicate_group_sizes()
+        dup_sizes = _duplicate_group_sizes(set().union(*stmt_by_bank.values()))
         for expense in expenses:
             expense.duplicate_count = dup_sizes.get(expense.id)
         duplicate_total = sum(1 for e in expenses if e.duplicate_count)

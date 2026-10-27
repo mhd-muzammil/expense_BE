@@ -177,16 +177,19 @@ def _apply_mode_filter(qs, mode):
 
 def _duplicate_group_sizes():
     """``{expense_id: n}`` for every entry that has identical twins — same date,
-    branch, category, amounts and payment modes (case-insensitive, as in
-    ExpenseCreateSerializer.validate) — where n is the size of its group."""
+    branch, category, amounts, payment modes, persons and remarks
+    (case-insensitive, as in ExpenseCreateSerializer.validate) — where n is the
+    size of its group. Equal salary advances to different people that day are
+    not twins."""
     groups = {}
     rows = Expense.objects.values_list(
         'id', 'date', 'branch_id', 'category', 'credited_amount', 'debited_amount',
         'credit_payment_mode', 'debit_payment_mode',
+        'credit_person', 'debit_person', 'credit_remark', 'debit_remark',
     )
-    for eid, d, branch, cat, credit, debit, cmode, dmode in rows:
+    for eid, d, branch, cat, credit, debit, *texts in rows:
         key = (d, branch, (cat or '').lower(), credit, debit,
-               (cmode or '').lower(), (dmode or '').lower())
+               *((t or '').lower() for t in texts))
         groups.setdefault(key, []).append(eid)
     return {eid: len(ids) for ids in groups.values() if len(ids) > 1 for eid in ids}
 

@@ -53,3 +53,18 @@ class ExpenseDuplicateTests(TestCase):
         res = self.client.get('/api/expenses/?duplicates=1')
         self.assertEqual(len(res.data['results']), 3)
         self.assertEqual(res.data['duplicate_total'], 3)
+
+    def test_equal_amounts_to_different_people_are_not_duplicates(self):
+        # Zammil and Vaseem: same day, branch and Rs 6,000 salary advance.
+        zammil = {**ENTRY, 'debited_amount': 6000, 'debit_person': 'ZAMMIL',
+                  'debit_remark': 'IMPS/P2A/628518762818/XXXXXXXXXX3314/ZammilSEPSal'}
+        vaseem = {**zammil, 'debit_person': 'VASEEM',
+                  'debit_remark': 'IMPS/P2A/628518967430/XXXXXXXXXX3911/VaseemSEPSal'}
+        self.assertEqual(self.client.post('/api/expenses/', zammil, format='json').status_code, 201)
+        self.assertEqual(self.client.post('/api/expenses/', vaseem, format='json').status_code, 201)
+
+        res = self.client.get('/api/expenses/')
+        self.assertEqual(res.data['duplicate_total'], 0)
+
+        # The same bank remark entered again is still caught.
+        self.assertEqual(self.client.post('/api/expenses/', zammil, format='json').status_code, 400)

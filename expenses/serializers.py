@@ -151,6 +151,10 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
                 debited_amount=debit or None,
                 credit_payment_mode__iexact=data.get('credit_payment_mode') or '',
                 debit_payment_mode__iexact=data.get('debit_payment_mode') or '',
+                credit_person__iexact=data.get('credit_person') or '',
+                debit_person__iexact=data.get('debit_person') or '',
+                credit_remark__iexact=data.get('credit_remark') or '',
+                debit_remark__iexact=data.get('debit_remark') or '',
             ).first()
             if existing:
                 amount = debit or credit

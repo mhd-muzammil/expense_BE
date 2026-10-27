@@ -2792,6 +2792,19 @@ def _bank_refs(text):
     return {t.upper() for t in re.split(r'[/\s:\-]+', text or '') if _BANK_REF_RE.match(t)}
 
 
+def _bank_name_key(text):
+    """Letters only, lower-case: "Jayakumar SALEM" → "jayakumarsalem"."""
+    return re.sub(r'[^a-z]', '', (text or '').lower())
+
+
+def _bank_names_person(narration, person):
+    """Whether a bank narration carries this person's name. Banks cut the name
+    short ("LingesSEPSal" for Lingesh), so the first six letters of the person
+    name must appear in the narration; names under four letters never match."""
+    p = _bank_name_key(person)
+    return len(p) >= 4 and p[:6] in _bank_name_key(narration)
+
+
 def _bank_match_map(bank, entries):
     """Reconcile bank-statement `entries` against the Expenses ledger.
 
@@ -2800,12 +2813,16 @@ def _bank_match_map(bank, entries):
     remarks are what tell apart several equal payments on one day (e.g. seven
     ₹8,000 salary advances), so this pairing is the right one.
 
-    Pass 2 — the remaining rows fall back to the SAME date, SAME amount, on the
-    SAME side (a bank debit ↔ an expense debit; a bank credit ↔ an expense
-    credit). An expense whose remark carries a reference of THIS statement is
-    left out of the fallback: it belongs to that row only, so a second copy of
-    it (the same bank remark entered twice) shows as unmatched instead of
-    covering some other person's payment.
+    Pass 2 — by name: the SAME date, SAME amount, on the SAME side (a bank
+    debit ↔ an expense debit; a bank credit ↔ an expense credit), and the bank
+    narration carries the expense's person ("…/PrasathSEPSa" ↔ PRASATH).
+
+    Pass 3 — the remaining rows fall back to date, amount and side alone.
+
+    An expense whose remark carries a reference of THIS statement takes part in
+    pass 1 only: it belongs to that row, so a second copy of it (the same bank
+    remark entered twice) shows as unmatched instead of covering some other
+    person's payment.
 
     Either way the expense must be under a payment mode that belongs to this
     bank, and matching is one-to-one: each expense satisfies only one bank row.
@@ -2902,12 +2919,36 @@ def _bank_match_map(bank, entries):
                 match_map[be.id] = c['detail']
                 break
 
-    # Pass 2: date + amount + side, among expenses that name no statement
-    # reference (a copy of an already-claimed one stays unmatched).
+    # Passes 2 and 3 only take expenses that name no statement reference (a
+    # copy of an already-claimed one stays unmatched).
+    rest = [c for c in candidates if id(c) not in claimed and not c['refs']]
+    rows_by_key = defaultdict(list)
+    for be in entries:
+        key = bank_key(be)
+        if key:
+            rows_by_key[key].append(be)
+
+    # Pass 2: date + amount + side, and the bank line carries the person's name.
+    for be in entries:
+        key = bank_key(be)
+        if be.id in match_map or not key:
+            continue
+        c = next((c for c in rest if id(c) not in claimed and c['key'] == key
+                  and _bank_names_person(be.narration, c['detail']['person'])), None)
+        if c:
+            claimed.add(id(c))
+            match_map[be.id] = c['detail']
+
+    # Pass 3: date + amount + side alone. An expense whose person is named on a
+    # bank row of that date and amount belongs to that row, so when the row is
+    # already taken it stays unmatched instead of covering someone else's.
     slots = defaultdict(list)
-    for c in candidates:
-        if id(c) not in claimed and not c['refs']:
-            slots[c['key']].append(c['detail'])
+    for c in rest:
+        if id(c) in claimed:
+            continue
+        if any(_bank_names_person(be.narration, c['detail']['person']) for be in rows_by_key.get(c['key'], ())):
+            continue
+        slots[c['key']].append(c['detail'])
     for be in entries:
         key = bank_key(be)
         if be.id not in match_map and key and slots.get(key):

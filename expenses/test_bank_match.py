@@ -5,7 +5,7 @@ from decimal import Decimal
 from django.test import TestCase
 
 from expenses.models import BankStatementEntry, Branch, Expense
-from expenses.views import _bank_match_map, _bank_refs
+from expenses.views import _bank_match_map, _bank_names_person, _bank_refs
 
 DAY = date(2026, 10, 12)
 PERUMAL = 'IMPS/P2A/628500979175/XXXXXXXXXX8269/PerumalSEPSa'
@@ -67,6 +67,24 @@ class BankMatchTests(TestCase):
         e.debited_amount = Decimal('800')
         e.save()
         self.assertEqual(self.matched(), {})
+
+    def test_without_a_reference_the_person_name_finds_the_row(self):
+        vishnu = self.expense('salary advance', 'VISHNU')
+        prasath = self.expense('', 'Prasath')
+        self.assertEqual(self.matched(), {self.rows[2].id: vishnu.id, self.rows[1].id: prasath.id})
+
+    def test_bank_shortened_names_still_match(self):
+        self.assertTrue(_bank_names_person('IMPS/P2A/628501957169/XXXXXXXXXX3997/LingesSEPSal', 'LINGESH'))
+        self.assertTrue(_bank_names_person('IMPS/P2A/628500307884/XXXXXXXXXX1929/JayakumarSEP', 'JAYAKUMAR SALEM'))
+        self.assertTrue(_bank_names_person('IMPS/P2A/628518834781/XXXXXXXXXX0480/VijayKanchiS', 'VIJAY KANCHI'))
+        self.assertFalse(_bank_names_person('IMPS/P2A/628510553513/XXXXXXXXXX1878/VijayananthS', 'VIJAY KANCHI'))
+        self.assertFalse(_bank_names_person('IMPS/P2A/628500979175/XXXXXXXXXX8269/PerumalSEPSa', 'Ram'))
+
+    def test_a_second_entry_for_a_taken_named_row_stays_unmatched(self):
+        first = self.expense('', 'VISHNU')
+        self.expense('', 'VISHNU')
+        # Not given to Perumal's or Prasath's row just because the amount fits.
+        self.assertEqual(self.matched(), {self.rows[2].id: first.id})
 
     def test_entries_without_a_reference_still_match_by_date_and_amount(self):
         a = self.expense('salary advance', 'Perumal')

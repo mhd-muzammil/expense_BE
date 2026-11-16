@@ -29,6 +29,7 @@ urlpatterns = [
     path('import/', views.import_expenses, name='import'),
     path('categories/', views.categories_view, name='categories'),
     path('profit-loss/', views.profit_loss_view, name='profit-loss'),
+    path('personal-pnl/', views.personal_pnl_view, name='personal-pnl'),
     path('insights/', views.insights_view, name='insights'),
     path('collections/', views.collections_view, name='collections'),
     path('staff-requests/', views.staff_requests_view, name='staff-requests'),

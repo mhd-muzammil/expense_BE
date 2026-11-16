@@ -926,7 +926,8 @@ _PNL_EXPENSE_GROUPS = {
     'PETROL ALLOWANCE': 'Travel & Fuel', 'PETROL ADVANCE': 'Travel & Fuel', 'TRAVEL': 'Travel & Fuel',
     'TRAVEL EXPENSE': 'Travel & Fuel', 'TRAVEL EXPENSES': 'Travel & Fuel', 'CAB': 'Travel & Fuel', 'RAPIDO': 'Travel & Fuel', 'TRANSPORT': 'Travel & Fuel',
     'GST': 'Statutory & Fees', 'GST FEE': 'Statutory & Fees', 'AUDITOR FEES': 'Statutory & Fees',
-    'LOAN RETURN': 'Loans & EMI', 'LAON': 'Loans & EMI', 'EMI': 'Loans & EMI', 'LAPTOP EMI': 'Loans & EMI',
+    'LOAN RETURN': 'Loans & EMI', 'LAON': 'Loans & EMI', 'EMI': 'Loans & EMI', 'GST LOAN RETURN': 'Loans & EMI',
+    'LAPTOP EMI': 'Purchases & Assets',  # a laptop bought in instalments: an asset, not a loan
     'ASSET': 'Purchases & Assets', 'ASST PURCHASE': 'Purchases & Assets', 'PURCHASE': 'Purchases & Assets',
     'TOOL PURCHASE': 'Purchases & Assets', 'SOFTWARE PURCHASE': 'Purchases & Assets', 'SERVER PURCHASE': 'Purchases & Assets',
     'LYSTLOC': 'Subscriptions & Licenses', 'GPS LICENSE': 'Subscriptions & Licenses', 'FB LEAD': 'Subscriptions & Licenses',
@@ -954,6 +955,20 @@ _PNL_EXPENSE_CATEGORIES = {
     'SALARY', 'EXPENSES', 'EXPENSE', 'VENDOR', 'MISC', 'PETROL', 'PETROL ALLOWANCE',
     'RENT', 'OFFICE RENT', 'GST', 'LOAN RETURN',
 }
+
+
+# Loans are money borrowed and paid back, not income or expense: taking a loan
+# is not a profit and repaying it is not a loss. The "without loans" P&L leaves
+# these categories out and shows them in a separate loan summary instead. Any
+# category with the word LOAN in it counts (so a new "BANK LOAN" is caught too),
+# plus EMI (loan instalments). LAPTOP EMI is a laptop bought in instalments -- a
+# real company cost -- so it stays in the P&L.
+_PNL_LOAN_WORD = re.compile(r'\b(LOAN|LOANS|LAON)\b')
+_PNL_LOAN_EXTRA = {'EMI'}
+
+
+def _pnl_is_loan(canonical_category):
+    return canonical_category in _PNL_LOAN_EXTRA or bool(_PNL_LOAN_WORD.search(canonical_category))
 
 
 def _pnl_canonical(name):
@@ -1005,6 +1020,8 @@ def profit_loss_view(request):
 
     Query params:
       fy       – financial-year start year, e.g. '2025' for FY 2025-26 (Apr–Mar).
+      exclude_loans – '1' leaves loan categories (see _pnl_is_loan) out of income,
+                 expense and the net; they are reported under `loans` either way.
                  Defaults to the FY containing the most recent expense (or today).
       branch   – branch id or (case-insensitive) location substring; junk/aggregate
                  branches are excluded from the default (all-branch) view.
@@ -1027,6 +1044,13 @@ def profit_loss_view(request):
     mode_val = request.query_params.get('payment_mode')
     if mode_val:
         qs = qs.filter(Q(credit_payment_mode__iexact=mode_val) | Q(debit_payment_mode__iexact=mode_val))
+
+    # ---- Personal spend stays out of the company P&L ----
+    # An Expenses entry that reconciles to a bank row marked Personal is the
+    # owner's own money, not the company's.
+    personal_ids = _personal_expense_ids()
+    if personal_ids:
+        qs = qs.exclude(id__in=personal_ids)
 
     # ---- Determine the financial year window ----
     fy_param = request.query_params.get('fy')
@@ -1078,8 +1102,27 @@ def profit_loss_view(request):
 
     # Build income & expense row lists. For income rows the per-month value is the
     # credit; for expense rows it's the debit — that's what a P&L shows.
+    exclude_loans = request.query_params.get('exclude_loans') in ('1', 'true', 'yes')
+    loan_received = {mk: Decimal('0.00') for mk in month_keys}
+    loan_repaid = {mk: Decimal('0.00') for mk in month_keys}
+    loan_categories = []
+
     income_rows, expense_rows = [], []
     for canon, entry in cat_map.items():
+        if _pnl_is_loan(canon):
+            # Money in on a loan category = loan received; money out = repaid.
+            for mk in month_keys:
+                slot = entry['months'].get(mk, {})
+                loan_received[mk] += slot.get('credit', Decimal('0.00'))
+                loan_repaid[mk] += slot.get('debit', Decimal('0.00'))
+            if entry['credit_total'] or entry['debit_total']:
+                loan_categories.append({
+                    'category': entry['display'],
+                    'received': str(entry['credit_total']),
+                    'repaid': str(entry['debit_total']),
+                })
+            if exclude_loans:
+                continue
         kind = _pnl_classify(canon, entry['credit_total'], entry['debit_total'])
         if kind == 'income':
             monthly = {mk: entry['months'].get(mk, {}).get('credit', Decimal('0.00')) for mk in month_keys}
@@ -1156,6 +1199,16 @@ def profit_loss_view(request):
         'total_income': str(total_income),
         'total_expense': str(total_expense),
         'net_profit': str(total_income - total_expense),
+        'loans_excluded': exclude_loans,
+        'loans': {
+            'received_by_month': {mk: str(loan_received[mk]) for mk in month_keys},
+            'repaid_by_month': {mk: str(loan_repaid[mk]) for mk in month_keys},
+            'net_by_month': {mk: str(loan_received[mk] - loan_repaid[mk]) for mk in month_keys},
+            'total_received': str(sum(loan_received.values(), Decimal('0.00'))),
+            'total_repaid': str(sum(loan_repaid.values(), Decimal('0.00'))),
+            'net': str(sum(loan_received.values(), Decimal('0.00')) - sum(loan_repaid.values(), Decimal('0.00'))),
+            'categories': sorted(loan_categories, key=lambda c: c['category']),
+        },
     })
 
 
@@ -3002,6 +3055,101 @@ def _bank_statement_by_expense(bank):
             'balance_dc': be.balance_dc,
         }
     return result
+
+
+def _personal_expense_ids():
+    """Ids of the Expenses entries that reconcile to a bank row marked
+    Personal. Matching runs over each bank's whole statement, exactly as the
+    statement page does, so the P&L skips the same entry the page shows."""
+    ids = set()
+    banks = (BankStatementEntry.objects
+             .filter(expense_type=BankStatementEntry.TYPE_PERSONAL)
+             .values_list('bank', flat=True).distinct())
+    for bank in set(banks):
+        entries = list(BankStatementEntry.objects.filter(bank=bank))
+        personal = {e.id for e in entries if e.expense_type == BankStatementEntry.TYPE_PERSONAL}
+        match_map, _ = _bank_match_map(bank, entries)
+        ids.update(d['id'] for be_id, d in match_map.items() if be_id in personal)
+    return ids
+
+
+def _fy_of(d):
+    """Start year of the Indian financial year (Apr-Mar) a date falls in."""
+    return d.year if d.month >= 4 else d.year - 1
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, RequireSection(SECTION_IDFC)])
+def personal_pnl_view(request):
+    """Personal P&L (shown under the Personal entries on the IDFC Statement
+    page, same access): the bank rows marked Personal, month by month for one
+    financial year -- money out (debits), money in (credits), the net, and the
+    transactions behind each month.
+
+    Query params: fy -- start year of the financial year, e.g. 2026 for
+    FY 2026-27. Defaults to the FY of the latest Personal row (or today).
+    """
+    personal = BankStatementEntry.objects.filter(
+        expense_type=BankStatementEntry.TYPE_PERSONAL, txn_date__isnull=False)
+
+    fy_param = request.query_params.get('fy')
+    if fy_param and fy_param.isdigit():
+        fy_start = int(fy_param)
+    else:
+        latest = personal.order_by('-txn_date').values_list('txn_date', flat=True).first()
+        fy_start = _fy_of(latest or datetime.now().date())
+
+    start_date, end_date, month_keys = _pnl_financial_year_bounds(fy_start)
+    months = {mk: {'month': mk, 'money_out': Decimal('0.00'), 'money_in': Decimal('0.00'), 'transactions': []}
+              for mk in month_keys}
+    for e in personal.filter(txn_date__gte=start_date, txn_date__lte=end_date).order_by('txn_date', 'id'):
+        m = months[e.txn_date.strftime('%Y-%m')]
+        m['money_out'] += e.debit or Decimal('0.00')
+        m['money_in'] += e.credit or Decimal('0.00')
+        m['transactions'].append({
+            'id': e.id,
+            'bank': e.bank,
+            'bank_display': e.get_bank_display(),
+            'txn_date': e.txn_date.isoformat(),
+            'narration': e.narration,
+            'ref_no': e.ref_no,
+            'debit': str(e.debit),
+            'credit': str(e.credit),
+        })
+
+    total_out = sum((m['money_out'] for m in months.values()), Decimal('0.00'))
+    total_in = sum((m['money_in'] for m in months.values()), Decimal('0.00'))
+
+    dates = personal.order_by('txn_date').values_list('txn_date', flat=True)
+    fys = {fy_start}
+    if dates.exists():
+        lo, hi = _fy_of(dates.first()), _fy_of(dates.last())
+        fys.update(range(lo, hi + 1))
+
+    return Response({
+        'fy_start': fy_start,
+        'fy_label': f'FY {fy_start}-{str(fy_start + 1)[-2:]}',
+        'available_fys': sorted(fys, reverse=True),
+        'months': [
+            {
+                'month': m['month'],
+                'money_out': str(m['money_out']),
+                'money_in': str(m['money_in']),
+                'net': str(m['money_in'] - m['money_out']),
+                'count': len(m['transactions']),
+                'transactions': m['transactions'],
+            }
+            for m in months.values()
+        ],
+        'total_out': str(total_out),
+        'total_in': str(total_in),
+        'net': str(total_in - total_out),
+        'count': sum(len(m['transactions']) for m in months.values()),
+        # IDFC rows nobody has sorted yet may still hold personal spend (IDFC is
+        # the statement the page lets you sort).
+        'unsorted_count': BankStatementEntry.objects.filter(
+            bank=BankStatementEntry.BANK_IDFC, expense_type='').count(),
+    })
 
 
 class _BankStatementViewSet(viewsets.ModelViewSet):

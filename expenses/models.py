@@ -1075,6 +1075,13 @@ class BankStatementEntry(models.Model):
     # 'Cr' / 'Dr' indicator that banks print next to the running balance.
     balance_dc = models.CharField(max_length=2, blank=True, default='')
     source_file = models.CharField(max_length=255, blank=True, default='')
+    # Whose money this was, set by hand on the statement page. '' = not sorted
+    # yet. A Personal row stays out of the company P&L (the Expenses entry it
+    # reconciles to is skipped there) and feeds the Personal P&L instead.
+    TYPE_PERSONAL = 'personal'
+    TYPE_OFFICE = 'office'
+    TYPE_CHOICES = [('', 'Not sorted'), (TYPE_PERSONAL, 'Personal'), (TYPE_OFFICE, 'Office')]
+    expense_type = models.CharField(max_length=10, choices=TYPE_CHOICES, blank=True, default='', db_index=True)
     # Fingerprint of the row (bank + date + narration + amounts + balance) used to
     # skip duplicates when the same statement file is uploaded more than once.
     row_hash = models.CharField(max_length=64, blank=True, default='', db_index=True)

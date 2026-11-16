@@ -774,6 +774,7 @@ class BankStatementEntrySerializer(serializers.ModelSerializer):
         fields = [
             'id', 'bank', 'bank_display', 'txn_date', 'value_date', 'narration',
             'ref_no', 'debit', 'credit', 'balance', 'balance_dc', 'source_file', 'uploaded_at',
+            'expense_type',
         ]
         read_only_fields = ['uploaded_at']
 
